@@ -35,8 +35,11 @@ Receive only: nothing here transmits.
 - Up to three more targets at once in the passband, each with its own filter, squelch and bearing, on the cores the
   engine leaves (DFTG).
 
-Coming, in ROADMAP.md's order: sample-rate slewing. Not planned: output to the KrakenSDR
-apps, mapping services or TAK.
+- Lines the sticks up in hardware to a fraction of a sample while a program reads the IQ server (sample-rate
+  slewing, with the rtlsdr_set_sample_slew of GoldCorpHF's rtlsdr-blog patch 0003).
+
+Everything in ROADMAP.md is done (but the other targets in the bearing log); passive radar is parked. Not planned:
+output to the KrakenSDR apps, mapping services or TAK.
 
 ## Files
 

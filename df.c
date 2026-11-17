@@ -19,11 +19,12 @@
  *  it is on (so nothing else may listen on a Kraken stick while this runs).
  *
  *    x6x00-df [-F] [-S name] [-p] [-f HZ] [-s RATE] [-g TENTHS] [-t OFFSET,BW] [-a uca|ula,N,MM] [-m METHOD]
- *             [-i SECONDS] [-n CHANNELS] [-D] [-C CORES] [-I BW] [-T BEARING[,DEG_PER_S[,DEAD_CH]]]
+ *             [-i SECONDS] [-n CHANNELS] [-D] [-C CORES] [-I BW] [-T BEARING[,DEG_PER_S[,DEAD_CH]]] [-Y]
  *      -F  in the foreground (else it goes to the background; its log /tmp/x6x00-df.log)
  *      -p  print one line per estimate (with -F: a test from a shell)
  *      -D  leave the tuners' PLL dither on (with our patched librtlsdr it is switched off: test 1g compares)
  *      -I  BW: the IQ server's band in Hz (default 25000: 64 kS/s); 0 no IQ server (ports 5000, 5001)
+ *      -Y  slew the sticks into line after every calibration (else only while the IQ server has a client)
  *      -C  READERS,ENGINE[,PRIO]: the cores (default 2,3,10: the readers on CPU2 at SCHED_FIFO 10, the engine on CPU3,
  *          the musb interrupt moved to CPU1); -C off leaves all of it to the kernel
  *      -n  open CH0 to CH(n-1) only (2-5; CH0 always, it has the noise source): a bench with another program on the
@@ -68,8 +69,11 @@
  * a must: with the dither on, the radio's Kraken's bearing swept the whole circle every 3 s; off, it held within 0.6
  * degrees for 30 s (2026-11-17). A weak symbol, so a library without it still links, and the daemon says so */
 extern int rtlsdr_set_dithering(rtlsdr_dev_t *dev, int dither) __attribute__((weak));
+/* the sample clock a fraction of a ppm off (rtlsdr-blog patch 0003): the sticks lined up in hardware (ROADMAP 10) */
+extern int rtlsdr_set_sample_slew(rtlsdr_dev_t *dev, double ppm) __attribute__((weak));
 #else
 typedef struct rtlsdr_dev rtlsdr_dev_t;
+static int (*const rtlsdr_set_sample_slew)(rtlsdr_dev_t *, double) = NULL;   /* no sticks: no slewing */
 #endif
 
 #ifndef M_PI
@@ -733,6 +737,7 @@ enum { IQ_DATA = 0, IQ_DUMMY = 1, IQ_CAL = 3 };
 
 static int             iq_bw_set = 25000;           /* the band served, Hz (-I BW; 0 no server) */
 static atomic_int      iq_clients;                  /* a client on 5000 */
+static atomic_bool     slew_due;                    /* a client came: line the sticks up (slew) at the next block */
 static atomic_bool     iq_tuned;                    /* the Kraken where an IQ program's FREQ put it (till the GUI tunes) */
 static atomic_uint     cal_gen;                     /* kb or the calibration changed (cal_lock) */
 static atomic_llong    noise_from = -1, noise_to = -1;  /* CH0's counts the last calibration's noise covered */
@@ -920,6 +925,7 @@ static void *iq_thread(void *arg) {
             continue;
         }
         atomic_store(&iq_clients, 1);
+        atomic_store(&slew_due, true);              /* its band lined up across, not only at its middle */
         pthread_mutex_lock(&iq_lock);
         last = iq_seq;
         if (!iq_worker_on) {
@@ -1836,6 +1842,88 @@ static void wait_settings(void) {
     take_cmds_closed();
 }
 
+/* ------------------------------------------------------------------------------- sample-rate slewing (ROADMAP 10)
+ * The sticks lined up in hardware to a fraction of a sample, as Heimdall does: each stick whose calibration left more
+ * than SLEW_TOL of a sample against CH0 runs SLEW_PPM fast or slow (rtlsdr_set_sample_slew, the RTL2832U's sample
+ * clock correction, while it streams) for as long as that fraction takes to slide away, then a calibration again;
+ * SLEW_ROUNDS at most. The engine corrects the fraction in software anyway, exactly at each target: slewing is for
+ * the IQ server, whose band then lines up across, so it runs after a calibration while a program reads it (or always
+ * with -Y). Not on the synthetic Kraken */
+#define SLEW_PPM    1.0         /* 1.024 samples a second at 1.024 MS/s */
+#define SLEW_TOL    0.03        /* of a sample: Heimdall's */
+#define SLEW_ROUNDS 3
+#define SLEW_SIGN   1           /* a positive tau wants that stick fast: on the radio, -1 doubled every fraction (11-17) */
+static bool slew_force;         /* -Y */
+
+static bool slew_wanted(void) {
+    return !synth && dev_is_open && rtlsdr_set_sample_slew && (slew_force || atomic_load(&iq_clients) > 0);
+}
+
+/* one pass: every stick past SLEW_TOL slewed at once, each for its own time; true if any was */
+static bool slew_once(void) {
+    double end[DF_MAXCH] = {0}, t0 = now_s();
+    bool   any = false;
+
+    for (int m = 1; m < nch && m < DF_MAXCH; m++) {
+        double f = cal.tau[m];
+
+        if (fabs(f) < SLEW_TOL || !ch[m].dev) continue;
+        if (rtlsdr_set_sample_slew(ch[m].dev, (f > 0 ? SLEW_PPM : -SLEW_PPM) * SLEW_SIGN) == 0) {
+            end[m] = t0 + fabs(f) / (rate * SLEW_PPM * 1e-6);
+            any = true;
+        }
+    }
+    for (bool left = any; left;) {
+        double t = now_s();
+
+        left = false;
+        for (int m = 1; m < nch && m < DF_MAXCH; m++) {
+            if (end[m] <= 0) continue;
+            if (t >= end[m]) {
+                rtlsdr_set_sample_slew(ch[m].dev, 0);
+                end[m] = 0;
+            } else {
+                left = true;
+            }
+        }
+        if (left) usleep(300);
+    }
+    return any;
+}
+
+static void tau_text(char *b, size_t n) {
+    size_t l = 0;
+
+    b[0] = 0;
+    for (int m = 1; m < nch && l < n; m++) l += (size_t)snprintf(b + l, n - l, " CH%d %+.3f", m, cal.tau[m]);
+}
+
+/* a calibration, and the sticks slewed into line after it when wanted */
+static bool calibrate_aligned(bool search) {
+    bool ok = calibrate(search);
+
+    if (!ok || !slew_wanted()) return ok;
+    for (int r = 0; r < SLEW_ROUNDS; r++) {
+        char b[160];
+
+        tau_text(b, sizeof(b));
+        if (!slew_once()) {
+            logf_("slew: in line (%s )", b);
+            return ok;
+        }
+        logf_("slew %d: from%s", r + 1, b);
+        usleep(50000);
+        if (!(ok = calibrate(false))) return ok;
+    }
+    {
+        char b[160];
+
+        tau_text(b, sizeof(b));
+        logf_("slew: after %d rounds%s", SLEW_ROUNDS, b);
+    }
+    return ok;
+}
+
 static void run(bool print) {
     pin_self(cpu_engine, 0, "the engine");
     musb_irq_away();
@@ -1895,7 +1983,7 @@ static void run(bool print) {
             }
         }
         coarse_align();
-        calibrate(true);
+        calibrate_aligned(true);
 
         double cal_try = now_s();
 
@@ -1923,7 +2011,7 @@ static void run(bool print) {
             }
             if (todo == 1 || (!have_cal && now_s() - cal_try > 10)) {
                 if (!have_cal) coarse_align();
-                calibrate(!have_cal);
+                calibrate_aligned(!have_cal);
                 cal_try = now_s();
                 send_state();
             }
@@ -1976,7 +2064,8 @@ static void run(bool print) {
             send_targets(seq);
             seq++;
             if (print) print_est(&e);
-            if (e.cal_wanted) calibrate(e.cal_wanted == 1);
+            if (e.cal_wanted) calibrate_aligned(e.cal_wanted == 1);
+            else if (have_cal && atomic_exchange(&slew_due, false) && slew_wanted()) calibrate_aligned(false);
 
             /* the state twice a second, the CPU and gpsd's view once a second */
             if (t - last_st >= 0.5) {
@@ -2019,7 +2108,7 @@ int main(int argc, char **argv) {
     double      a = 0, b = 0;
 
     df_array_uca(&arr, 5, 0.294);               /* the calculator at 433.92 MHz, s 0.5 */
-    while ((o = getopt(argc, argv, "FS:pf:s:g:t:a:m:i:n:DT:C:I:")) != -1) {
+    while ((o = getopt(argc, argv, "FS:pf:s:g:t:a:m:i:n:DT:C:I:Y")) != -1) {
         switch (o) {
             case 'F': front = true; break;
             case 'S': sock_name = optarg; break;
@@ -2049,6 +2138,7 @@ int main(int argc, char **argv) {
                 if ((n_open = atoi(optarg)) < 2 || n_open > NCH_KRAKEN) return 1;
                 break;
             case 'D': dither_on = true; break;
+            case 'Y': slew_force = true; break;
             case 'I': iq_bw_set = atoi(optarg); break;
             case 'C':
                 if (!strcmp(optarg, "off")) cores_on = false;

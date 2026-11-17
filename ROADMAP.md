@@ -139,6 +139,13 @@ tried with KrakenRF's own software, nor a CAL frame seen.
 
 ## 10. Sample-rate slewing
 
+Done 2026-11-17: rtlsdr-blog patch 0003 (GoldCorpHF), rtlsdr_set_sample_slew: the RTL2832U's sample clock
+correction (0x3e-0x3f, 2^-24 a step, 0.06 ppm) written while streaming, without the reset a new rate takes. After a
+calibration while the IQ server has a client (or always with -Y), each stick past 0.03 sample runs 1 ppm fast or
+slow for |tau| / (rate x 1 ppm) seconds, then a calibration again, three rounds at most. On the radio's Kraken: from
+CH1 -0.041, CH2 +0.446, CH3 -0.044, CH4 +0.486 of a sample to +0.011, +0.015, -0.012, +0.022 in one round, no slip.
+The direction was found there (the other way doubled every fraction).
+
 - What it is: Heimdall lines the sticks up in hardware, running one stick's sample rate a few ppm fast or slow until
   its samples have slid into line (the RTL2832U's resampler ratio, written while it streams). x6x00-df lines them up
   in software instead, and corrects the fraction of a sample per target, which is exact at the target and cheap.
