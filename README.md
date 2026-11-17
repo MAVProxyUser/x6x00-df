@@ -38,7 +38,7 @@ Receive only: nothing here transmits.
 - Lines the sticks up in hardware to a fraction of a sample while a program reads the IQ server (sample-rate
   slewing, with the rtlsdr_set_sample_slew of GoldCorpHF's rtlsdr-blog patch 0003).
 
-Everything in ROADMAP.md is done (but the other targets in the bearing log); passive radar is parked. Not planned:
+Everything in ROADMAP.md is done; passive radar is parked. Not planned:
 output to the KrakenSDR apps, mapping services or TAK.
 
 ## Files

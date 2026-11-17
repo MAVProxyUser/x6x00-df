@@ -177,7 +177,7 @@ typedef struct {
     int16_t  uncert_ddeg;
     int16_t  level_ddb;         /* the target over the floor */
     uint16_t age_ds;            /* since its bearing was last good, 0xffff never */
-    uint16_t pad;
+    int16_t  snr_ddb;           /* its SNR (per element, tenths of dB) */
 } df_tg_t;
 
 typedef struct {

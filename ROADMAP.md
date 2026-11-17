@@ -110,8 +110,8 @@ the share of blocks it kept up with. Each target is an engine of its own on a th
 rings as the main one, a block behind it, with its settings and calibration; the main target never waits for them.
 Measured on the radio with five sticks streaming (the engine's CPU3 at 77 %): target 2 on CPU2 (with the readers,
 88 % busy) and target 3 on CPU0 (the GUI's, 81 %) keep up with every block; target 4 on CPU1, which the USB
-interrupt's copying fills, with about 60 %. All at nice 10, below the GUI. Not done: the targets in the bearing
-log (the main one only), and the bearings' waterfall stays the main target's.
+interrupt's copying fills, with about 60 %. All at nice 10, below the GUI. The bearing log has them too (a target
+column, 1-4; 2026-11-17 evening). The bearings' waterfall stays the main target's.
 
 - Up to four targets (KrakenRF allows 16; the radio's cores allow about four) inside the Kraken's passband, each with
   its own channel filter, squelch and bearing, sharing one calibration. Channel filtering is the cost: each target

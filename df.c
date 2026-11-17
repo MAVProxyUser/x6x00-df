@@ -1126,6 +1126,7 @@ typedef struct {
     bool        joinable;
     pthread_t   th;
     df_tg_t     out;                    /* the newest, for DFTG (tg_lock) */
+    uint32_t    n_out, n_logged;        /* estimates taken (tg_lock), and the last one logged (the engine's) */
     double      last_good_at, last_bearing, last_mirror, last_uncert;
     double      held_bearing, held_mirror, held_uncert, held_fit;
 } target_t;
@@ -1173,11 +1174,13 @@ static void tg_take(target_t *t, const df_est_t *e, int done_pct) {
         o.uncert_ddeg = clamp16(t->last_uncert * 10);
     }
     o.level_ddb = clamp16(e->level_db * 10);
+    o.snr_ddb = clamp16(e->doa.snr_db * 10);
     o.age_ds = t->last_good_at < 0 ? 0xffff : (uint16_t)fmin(65534, (now - t->last_good_at) * 10);
     pthread_mutex_lock(&tg_lock);
     o.off_hz = t->off;
     o.bw_hz = t->bw;
     t->out = o;
+    t->n_out++;
     pthread_mutex_unlock(&tg_lock);
 }
 
@@ -1322,6 +1325,9 @@ static void tg_end_all(void) {
     }
 }
 
+static void log_row(int target, int64_t hz, double bearing, double uncert, double fit, double level, double snr, int nsrc,
+                    const char *other);
+
 static void send_targets(uint32_t seq) {
     df_tg_msg_t m;
     bool        any = false;
@@ -1340,8 +1346,16 @@ static void send_targets(uint32_t seq) {
             any = true;
         }
     }
+    bool fresh[DF_PROTO_TARGETS] = {false};
+
+    for (int i = 0; i < DF_PROTO_TARGETS; i++)
+        if (tg[i].bw && tg[i].n_out != tg[i].n_logged) fresh[i] = true, tg[i].n_logged = tg[i].n_out;
     pthread_mutex_unlock(&tg_lock);
     if (any) send_msg(&m, sizeof(m));
+    for (int i = 0; i < DF_PROTO_TARGETS; i++)  /* into the bearing log too, each as the main one: when it counts */
+        if (fresh[i] && m.tg[i].gate && m.tg[i].bearing_ddeg >= 0)
+            log_row(i + 2, (int64_t)fc + m.tg[i].off_hz, m.tg[i].bearing_ddeg / 10.0, m.tg[i].uncert_ddeg / 10.0,
+                    m.tg[i].fit_pct / 100.0, m.tg[i].level_ddb / 10.0, m.tg[i].snr_ddb / 10.0, 0, NULL);
 }
 
 static void send_state(void);
@@ -1549,15 +1563,19 @@ static FILE  *log_f;
 static char   log_day[16];
 static double log_last;
 
-static void log_bearing(const df_est_t *e) {
+/* one row of the bearing log, any target's (1 the main one, 2-4 the others): a CSV file a day in LOG_DIR, each
+ * target at most every LOG_EVERY_S. snr NAN, other NULL: not known (the other targets') */
+static void log_row(int target, int64_t hz, double bearing, double uncert, double fit, double level, double snr, int nsrc,
+                    const char *other) {
     static const char *const mnames[] = {"MUSIC", "BARTLETT", "CAPON", "MEM", "TNA", "ROOT-MUSIC"};
+    static double            last[1 + DF_PROTO_TARGETS];
     double                   t = now_s(), hd = 0, lat = 0, lon = 0;
     struct timespec          ts;
     struct tm                tm;
     char                     day[16], when[32];
 
-    if (!log_on || !e->gate || t - log_last < LOG_EVERY_S) return;
-    log_last = t;
+    if (!log_on || target < 1 || target > 1 + DF_PROTO_TARGETS || t - last[target - 1] < LOG_EVERY_S) return;
+    last[target - 1] = t;
     clock_gettime(CLOCK_REALTIME, &ts);
     gmtime_r(&ts.tv_sec, &tm);
     strftime(day, sizeof(day), "%Y-%m-%d", &tm);
@@ -1574,7 +1592,7 @@ static void log_bearing(const df_est_t *e) {
         snprintf(log_day, sizeof(log_day), "%s", day);
         if (fresh)
             fprintf(log_f, "utc,freq_hz,bearing_ant0,heading,heading_from,bearing,plus_minus,fit_pct,level_db,snr_db,"
-                           "method,sources,other_bearings,lat,lon\n");
+                           "method,sources,other_bearings,lat,lon,target\n");
     }
     pthread_mutex_lock(&gps_lock);
     int  src = df_gps_heading(&gps, t, &hd);
@@ -1582,17 +1600,28 @@ static void log_bearing(const df_est_t *e) {
     pthread_mutex_unlock(&gps_lock);
     const char *from = src == DF_HEAD_COMPASS ? "compass" : src == DF_HEAD_COURSE ? "gps course" : hand_heading ? "set" : "";
     if (!src) hd = hand_heading;
+    fprintf(log_f, "%s.%03ldZ,%lld,%.1f,", when, ts.tv_nsec / 1000000, (long long)hz, bearing);
+    if (*from) fprintf(log_f, "%.1f,%s,%.1f,", hd, from, fmod(bearing + hd, 360.0));
+    else fprintf(log_f, ",,,");
+    fprintf(log_f, "%.1f,%.0f,%.1f,", uncert, fit * 100, level);
+    if (isnan(snr)) fprintf(log_f, ",");
+    else fprintf(log_f, "%.1f,", snr);
+    fprintf(log_f, "%s,", mnames[method >= 0 && method < (int)(sizeof(mnames) / sizeof(mnames[0])) ? method : 0]);
+    if (nsrc > 0) fprintf(log_f, "%d,%s,", nsrc, other ? other : "");
+    else fprintf(log_f, ",,");
+    if (fix) fprintf(log_f, "%.7f,%.7f,%d\n", lat, lon, target);
+    else fprintf(log_f, ",,%d\n", target);
+    fflush(log_f);
+}
+
+static void log_bearing(const df_est_t *e) {
     char other[48] = "";
+
+    if (!e->gate) return;
     for (int i = 0; i < e->doa.npeaks && i < 3; i++)
         snprintf(other + strlen(other), sizeof(other) - strlen(other), "%s%.1f", i ? " " : "", e->doa.peaks[i]);
-    fprintf(log_f, "%s.%03ldZ,%lld,%.1f,", when, ts.tv_nsec / 1000000, (long long)fc + f_off, e->doa.bearing);
-    if (*from) fprintf(log_f, "%.1f,%s,%.1f,", hd, from, fmod(e->doa.bearing + hd, 360.0));
-    else fprintf(log_f, ",,,");
-    fprintf(log_f, "%.1f,%.0f,%.1f,%.1f,%s,%d,%s,", e->uncert_deg, e->doa.fit * 100, e->level_db, e->doa.snr_db,
-            mnames[method >= 0 && method < 5 ? method : 0], e->doa.nsrc > 0 ? e->doa.nsrc : 1, other);
-    if (fix) fprintf(log_f, "%.7f,%.7f\n", lat, lon);
-    else fprintf(log_f, ",\n");
-    fflush(log_f);
+    log_row(1, (int64_t)fc + f_off, e->doa.bearing, e->uncert_deg, e->doa.fit, e->level_db, e->doa.snr_db,
+            e->doa.nsrc > 0 ? e->doa.nsrc : 1, other);
 }
 
 static void send_estimate(const df_est_t *e, uint32_t seq) {
