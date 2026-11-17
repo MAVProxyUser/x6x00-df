@@ -3,7 +3,7 @@
 # rtlsdr_set_dithering; "make x6x00-df" builds it on a Linux host that has those.
 CC     ?= cc
 CFLAGS ?= -O2 -Wall -Wextra
-ENGINE  = df_cal.c df_chan.c df_doa.c df_engine.c
+ENGINE  = df_cal.c df_chan.c df_doa.c df_engine.c df_gps.c
 DAEMON  = $(shell sed -e '/^\#/d' df_sources)
 
 all: test

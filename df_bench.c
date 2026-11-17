@@ -103,7 +103,7 @@ int main(int argc, char **argv) {
             for (int j = 0; j < NCH; j++) R[i * NCH + j] = v[i] * conj(v[j]) * 10 + (i == j ? 1 : 0);
         t0 = cpu();
         for (int i = 0; i < 200; i++) {
-            df_doa(R, &e.arr, &e.steer, DF_MUSIC, 1, false, &d);
+            df_doa(R, &e.arr, &e.steer, DF_MUSIC, 1, 1000, false, &d);
             df_fit_without(R, &e.arr, &e.steer, fw);
         }
         double t_doa = (cpu() - t0) / 200;

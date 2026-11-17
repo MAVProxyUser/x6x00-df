@@ -12,6 +12,7 @@
  */
 
 #include "df.h"
+#include "df_gps.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -350,8 +351,8 @@ static void test_bearings(void) {
 }
 
 static void test_methods(void) {
-    df_method_t ms[] = {DF_BARTLETT, DF_CAPON, DF_MEM};
-    const char *names[] = {"Bartlett", "Capon", "MEM"};
+    df_method_t ms[] = {DF_BARTLETT, DF_CAPON, DF_MEM, DF_TNA};
+    const char *names[] = {"Bartlett", "Capon", "MEM", "TNA"};
     df_array_t  arr;
     hw_t        hw[5];
     df_cal_t    cal;
@@ -362,7 +363,7 @@ static void test_methods(void) {
     src_t     s = nfm(123, 20);
     uint8_t **ch = gen(hw, &arr, &s, 1, START * 2 + 6 * BLOCK, 0);
 
-    for (int k = 0; k < 3; k++) {
+    for (int k = 0; k < 4; k++) {
         df_engine_t e;
         df_est_t    est;
 
@@ -554,6 +555,114 @@ static void test_slip(int lost, int must_catch) {
     free_ch(ch, 5);
 }
 
+/* gpsd's reports (df_gps.c): the fix, the course while moving and held after, a compass first, junk passed over */
+static void test_gps(void) {
+    df_gps_t g;
+    double   deg = -1, lat = 0, lon = 0;
+
+    df_gps_init(&g);
+    check(df_gps_heading(&g, 0, &deg) == DF_HEAD_NONE, "gps: no heading before any report");
+    df_gps_line(&g, "{\"class\":\"VERSION\",\"release\":\"3.25\"}", 1);
+    df_gps_line(&g, "{\"class\":\"TPV\",\"device\":\"/dev/ttyACM0\",\"mode\":1}", 1);
+    check(!df_gps_fix(&g, 1, &lat, &lon), "gps: mode 1 is no fix");
+    df_gps_line(&g, "{\"class\":\"TPV\",\"mode\":3,\"lat\":40.1012,\"lon\":-83.1234,\"speed\":0.3,\"track\":77.0}", 2);
+    check(df_gps_fix(&g, 2, &lat, &lon) && fabs(lat - 40.1012) < 1e-9 && fabs(lon + 83.1234) < 1e-9,
+          "gps: a 3D fix read (%.4f %.4f)", lat, lon);
+    check(df_gps_heading(&g, 2, &deg) == DF_HEAD_NONE, "gps: standing still, the course is not a heading");
+    df_gps_line(&g, "{\"class\" : \"TPV\", \"mode\" : 2, \"lat\" : 40.2, \"lon\" : -83.2, \"speed\" : 12.5, \"track\" : 361.5}", 3);
+    check(df_gps_heading(&g, 3, &deg) == DF_HEAD_COURSE && fabs(deg - 1.5) < 1e-9,
+          "gps: moving, the course is the heading (%.1f, wrapped)", deg);
+    df_gps_line(&g, "{\"class\":\"TPV\",\"mode\":3,\"lat\":40.2,\"lon\":-83.2,\"speed\":0.0,\"track\":200.0}", 60);
+    check(df_gps_heading(&g, 60, &deg) == DF_HEAD_COURSE && fabs(deg - 1.5) < 1e-9,
+          "gps: stopped, the last course held (%.1f)", deg);
+    df_gps_line(&g, "{\"class\":\"TPV\",\"mode\":3,\"lat\":40.2,\"lon\":-83.2,\"speed\":0.0}", 3 + DF_GPS_HOLD_S + 1);
+    check(df_gps_heading(&g, 3 + DF_GPS_HOLD_S + 1, &deg) == DF_HEAD_NONE, "gps: the held course let go after %g s",
+          DF_GPS_HOLD_S);
+    df_gps_line(&g, "{\"class\":\"ATT\",\"heading\":271.25,\"pitch\":1.0}", 200);
+    df_gps_line(&g, "{\"class\":\"TPV\",\"mode\":3,\"speed\":20.0,\"track\":90.0}", 200);
+    check(df_gps_heading(&g, 200, &deg) == DF_HEAD_COMPASS && fabs(deg - 271.25) < 1e-9,
+          "gps: a compass before the course (%.2f)", deg);
+    check(df_gps_heading(&g, 200 + DF_GPS_FRESH_S + 1, &deg) == DF_HEAD_NONE,
+          "gps: reports stopped, no heading (the one set by hand)");
+    df_gps_line(&g, "{\"class\":\"TPV\",\"mode\":3,\"lat\":null,\"track\":\"x\"}", 300);
+    df_gps_line(&g, "garbage {\"track\":5", 300);
+    check(df_gps_fix(&g, 300, &lat, &lon), "gps: a null or junk line leaves the last position");
+}
+
+/* Several sources (df_doa nsrc, MDL): two transmitters 120 degrees apart both found; AUTO counts two, and one alone */
+static void test_two_sources(void) {
+    df_array_t  arr;
+    hw_t        hw[5];
+    df_cal_t    cal;
+    src_t       s[2] = {nfm(37, 22), nfm(157, 19)};
+
+    s[1].fm1 = 600, s[1].fm2 = 2100, s[1].ph2 = 2.2;
+    df_array_uca(&arr, 5, 0.5 * DF_C / (FC + FOFF) / (2 * sin(M_PI / 5)));
+    hw_random(hw, 5);
+    calibrate(hw, 5, &cal);
+    uint8_t **ch = gen(hw, &arr, s, 2, START * 2 + 6 * BLOCK, 0);
+
+    for (int mode = 0; mode < 2; mode++) {
+        df_engine_t e;
+        df_est_t    est;
+
+        engine_for(&e, &arr);
+        e.nsrc = mode ? -1 : 2;
+        df_engine_set_cal(&e, &cal);
+        run(&e, ch, &cal, 0, 5, &est);
+        double other = est.doa.npeaks ? est.doa.peaks[0] : -1;
+        bool   both = (angdiff(est.doa.bearing, 37) < 3 && angdiff(other, 157) < 3) ||
+                      (angdiff(est.doa.bearing, 157) < 3 && angdiff(other, 37) < 3);
+
+        check(both && est.doa.nsrc == 2 && est.gate, "two sources (%s): %.1f and %.1f (37, 157), %d taken, gate %d",
+              mode ? "AUTO" : "2", est.doa.bearing, other, est.doa.nsrc, est.gate);
+        df_engine_free(&e);
+    }
+    free_ch(ch, 5);
+
+    src_t one = nfm(250, 20);
+    uint8_t **c1 = gen(hw, &arr, &one, 1, START * 2 + 6 * BLOCK, 0);
+    df_engine_t e;
+    df_est_t    est;
+
+    engine_for(&e, &arr);
+    e.nsrc = -1;
+    df_engine_set_cal(&e, &cal);
+    run(&e, c1, &cal, 0, 5, &est);
+    check(est.doa.nsrc == 1 && angdiff(est.doa.bearing, 250) < 1.5 && est.gate, "AUTO with one: %d source, %.2f (250)",
+          est.doa.nsrc, est.doa.bearing);
+    df_engine_free(&e);
+    free_ch(c1, 5);
+}
+
+/* Forward-backward averaging on a ULA: a source and its coherent copy (multipath), MUSIC with two sources */
+static void test_fb_ula(void) {
+    double complex R[25], R2[25];
+    double         val[5];
+    double complex V[25];
+
+    /* R of a ULA with two fully coherent sources: rank one before FB, two after */
+    df_array_t arr;
+    df_array_ula(&arr, 5, 0.5 * DF_C / (FC + FOFF));
+    double complex a1[5], a2[5], v[5];
+    double lambda = DF_C / (FC + FOFF);
+
+    df_steer_at(&arr, lambda, 60, a1);
+    df_steer_at(&arr, lambda, 110, a2);
+    for (int i = 0; i < 5; i++) v[i] = a1[i] + 0.8 * cexp(I * 0.7) * a2[i];
+    for (int i = 0; i < 5; i++)
+        for (int j = 0; j < 5; j++) R[i * 5 + j] = v[i] * conj(v[j]) + (i == j ? 0.01 : 0);
+    memcpy(R2, R, sizeof(R));
+    df_eigh(R, 5, val, V);
+    double before = 10 * log10(val[1] / val[2]);
+    df_fb(R2, 5);
+    df_eigh(R2, 5, val, V);
+    double after = 10 * log10(val[1] / val[2]);
+
+    check(before < 3 && after > 10, "FB: two coherent sources on a ULA decorrelated (2nd eigenvalue over the noise %.1f dB "
+          "before, %.1f after)", before, after);
+}
+
 int main(int argc, char **argv) {
     verbose = argc > 1 && !strcmp(argv[1], "-v");
     test_calc();
@@ -566,6 +675,9 @@ int main(int argc, char **argv) {
     test_dead_antenna();
     test_slip(256, 1);
     test_slip(1, 0);
+    test_gps();
+    test_two_sources();
+    test_fb_ula();
     printf("df_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

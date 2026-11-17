@@ -17,6 +17,9 @@ In the order they are built:
 
 ## 1. A core of its own
 
+Done 2026-11-17: readers on CPU2 at SCHED_FIFO 10, the engine on CPU3, the musb interrupt on CPU1 (seen in
+`/proc`). Page I ran 31 minutes with five channels without a slip before it, so slips were not the measure.
+
 - The engine thread pinned to one core, the USB reader thread to another, and the musb interrupt to a third
   (`/proc/irq/N/smp_affinity`), so the PIO copies, the readers and the maths never wait on each other. The GUI and
   the rest keep the remaining core and share the others when they are idle.
@@ -48,6 +51,9 @@ In the order they are built:
 
 ## 4. gpsd
 
+Done 2026-11-17: tried with a made-up GPS on a pseudo-terminal added to the radio's gpsd (10 knots, course 135):
+page I turned north up, its HEADING row `IN USE: GPS COURSE 135 (GPSD)`.
+
 - When gpsd runs (port 2947), x6x00-df reads its TPV reports: the position, and the course over the ground while
   moving faster than about 2 m/s. In motion the course is the array's heading, so a bearing becomes a compass
   bearing without a heading set by hand (a vehicle with the array fixed to it, ANT 0 forward). An ATT report with a
@@ -62,6 +68,9 @@ In the order they are built:
   "sharing"? It stays on the radio; the owner may say no.)
 
 ## 6. More methods
+
+TNA done; several sources (2, 3, AUTO from the eigenvalues' widest gap: MDL counted noise as sources) and
+forward-backward averaging done, in the host checks; ROOT-MUSIC and spatial smoothing to come.
 
 - **TNA** (thermal noise algorithm, `1 / a^H R^-2 a`): a step from Capon, which already inverts R.
 - **More than one source**: the number of sources from the eigenvalues (MDL), MUSIC's noise subspace of M-K vectors,

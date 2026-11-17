@@ -19,10 +19,12 @@
  *  it is on (so nothing else may listen on a Kraken stick while this runs).
  *
  *    x6x00-df [-F] [-S name] [-p] [-f HZ] [-s RATE] [-g TENTHS] [-t OFFSET,BW] [-a uca|ula,N,MM] [-m METHOD]
- *             [-i SECONDS] [-n CHANNELS] [-D] [-T BEARING[,DEG_PER_S[,DEAD_CH]]]
+ *             [-i SECONDS] [-n CHANNELS] [-D] [-C CORES] [-T BEARING[,DEG_PER_S[,DEAD_CH]]]
  *      -F  in the foreground (else it goes to the background; its log /tmp/x6x00-df.log)
  *      -p  print one line per estimate (with -F: a test from a shell)
  *      -D  leave the tuners' PLL dither on (with our patched librtlsdr it is switched off: test 1g compares)
+ *      -C  READERS,ENGINE[,PRIO]: the cores (default 2,3,10: the readers on CPU2 at SCHED_FIFO 10, the engine on CPU3,
+ *          the musb interrupt moved to CPU1); -C off leaves all of it to the kernel
  *      -n  open CH0 to CH(n-1) only (2-5; CH0 always, it has the noise source): a bench with another program on the
  *          last stick. The array keeps its positions: UCA-5 with -n 4 is the circle's first four
  *      -T  a synthetic Kraken instead of the sticks: a carrier at BEARING degrees (turning DEG_PER_S), on 6 s
@@ -33,6 +35,7 @@
 #define _GNU_SOURCE
 #include "df.h"
 #include "df_proto.h"
+#include "df_gps.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -40,12 +43,15 @@
 #include <math.h>
 #include <stdarg.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <time.h>
@@ -162,6 +168,144 @@ static void put(chan_t *c, const uint8_t *buf, uint32_t len) {
     if (atomic_exchange(&c->t0_reset, 0) || est < atomic_load(&c->t0)) atomic_store(&c->t0, est);
 }
 
+/* ------------------------------------------------------------------------------------------------ gpsd (DFGP) */
+
+/* gpsd when it runs (ROADMAP.md, 4): its reports read on a thread of their own, the heading and the fix sent to the
+ * GUI once a second. DF_GPSD=host:port for another gpsd (default 127.0.0.1:2947); tried again every 5 s while it is
+ * not there. Nothing here is needed: with no gpsd the bearings keep the heading set by hand */
+static pthread_mutex_t gps_lock = PTHREAD_MUTEX_INITIALIZER;
+static df_gps_t        gps;
+static atomic_bool     gps_up;
+
+static void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+static double now_s(void);
+
+static void *gps_thread(void *arg) {
+    const char *e = getenv("DF_GPSD");
+    char        host[64] = "127.0.0.1";
+    int         port = 2947;
+    bool        said = false;
+
+    (void)arg;
+    if (e) sscanf(e, "%63[^:]:%d", host, &port);
+    while (!atomic_load(&quit_now)) {
+        struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port)};
+        int                fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        char               buf[4096];
+        size_t             have = 0;
+        static const char  watch[] = "?WATCH={\"enable\":true,\"json\":true}\n";
+
+        if (fd < 0 || inet_pton(AF_INET, host, &a.sin_addr) != 1 || connect(fd, (struct sockaddr *)&a, sizeof(a)) ||
+            write(fd, watch, sizeof(watch) - 1) != (ssize_t)(sizeof(watch) - 1)) {
+            if (fd >= 0) close(fd);
+            for (int i = 0; i < 50 && !atomic_load(&quit_now); i++) usleep(100000);
+            continue;
+        }
+        atomic_store(&gps_up, true);
+        if (!said) logf_("gpsd: reading %s:%d", host, port), said = true;
+        while (!atomic_load(&quit_now)) {
+            struct pollfd p = {.fd = fd, .events = POLLIN};
+            int           r = poll(&p, 1, 1000);
+
+            if (r == 0) continue;
+            ssize_t n = r > 0 ? read(fd, buf + have, sizeof(buf) - 1 - have) : -1;
+            if (n <= 0) break;
+            have += (size_t)n;
+            buf[have] = 0;
+            char *line = buf, *nl;
+            while ((nl = strchr(line, '\n'))) {
+                *nl = 0;
+                pthread_mutex_lock(&gps_lock);
+                df_gps_line(&gps, line, now_s());
+                pthread_mutex_unlock(&gps_lock);
+                line = nl + 1;
+            }
+            have = strlen(line);
+            memmove(buf, line, have);
+            if (have >= sizeof(buf) - 1) have = 0;         /* a line too long for us: let go of it */
+        }
+        close(fd);
+        atomic_store(&gps_up, false);
+    }
+    return NULL;
+}
+
+static void send_msg(const void *m, size_t n);
+
+static void send_gps(void) {
+    df_gp_msg_t m;
+    double      t = now_s(), deg = 0, lat = 0, lon = 0;
+
+    memset(&m, 0, sizeof(m));
+    memcpy(m.tag, "DFGP", 4);
+    pthread_mutex_lock(&gps_lock);
+    int  src = df_gps_heading(&gps, t, &deg);
+    bool fix = df_gps_fix(&gps, t, &lat, &lon);
+    int  mode = gps.mode;
+    double speed = gps.speed;
+    pthread_mutex_unlock(&gps_lock);
+    m.gpsd = atomic_load(&gps_up);
+    m.mode = (uint8_t)(fix ? mode : 0);
+    m.head_src = (uint8_t)src;
+    m.head_ddeg = (int16_t)(src ? lrint(deg * 10) % 3600 : -1);
+    m.speed_cms = speed < 0 ? 0xffff : (uint16_t)fmin(65534, speed * 100);
+    m.lat_e7 = fix ? (int32_t)llround(lat * 1e7) : 0;
+    m.lon_e7 = fix ? (int32_t)llround(lon * 1e7) : 0;
+    send_msg(&m, sizeof(m));
+}
+
+/* --------------------------------------------------------------------------------------------- the cores (-C) */
+
+/* Where the work runs on the radio's four Cortex-A7 cores (ROADMAP.md, 1). Every interrupt lands on CPU0 by default,
+ * the musb host's PIO copies (25,000 a second with five sticks) among the base's serial stream, its I2C and the
+ * WiFi's: so the musb interrupt goes to CPU1, the sticks' readers to CPU2 at a modest real-time priority (a reader that
+ * waits too long is what makes a stick lose samples), the engine to CPU3 as a normal thread (behind, it overruns its
+ * ring and says so). Never Heimdall's priority 99 with the real-time throttle off: the GUI must keep feeding the base
+ * every second. -C READERS,ENGINE,PRIO (default 2,3,10), -C off: none of it. Nothing is fatal: a step that fails is
+ * logged once and the rest goes on */
+static int cpu_readers = 2, cpu_engine = 3, rt_prio = 10;
+static bool cores_on = true;
+
+static void logf_(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
+static void pin_self(int cpu, int prio, const char *who) {
+    cpu_set_t set;
+
+    if (!cores_on || cpu < 0 || cpu >= CPU_SETSIZE || cpu >= sysconf(_SC_NPROCESSORS_ONLN)) return;
+    CPU_ZERO(&set);
+    CPU_SET(cpu, &set);
+    if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set)) logf_("%s: not pinned to CPU%d", who, cpu);
+    if (prio > 0) {
+        struct sched_param sp = {.sched_priority = prio};
+
+        if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp))
+            logf_("%s: no real-time priority (%s)", who, strerror(errno));
+    }
+}
+
+/* The musb host's interrupt on CPU1 (a mask of 2), from /proc/interrupts' "musb-hdrc" line; said once */
+static void musb_irq_away(void) {
+    FILE *f = fopen("/proc/interrupts", "r");
+    char  l[512], path[64];
+    int   irq = -1;
+
+    if (!cores_on || !f) {
+        if (f) fclose(f);
+        return;
+    }
+    while (fgets(l, sizeof(l), f))
+        if (strstr(l, "musb-hdrc") && sscanf(l, " %d:", &irq) == 1) break;
+    fclose(f);
+    if (irq < 0) return;
+    snprintf(path, sizeof(path), "/proc/irq/%d/smp_affinity", irq);
+    if ((f = fopen(path, "w"))) {
+        bool ok = fputs("2", f) >= 0;
+
+        ok = fclose(f) == 0 && ok;
+        logf_("the musb interrupt (%d) %s CPU1", irq, ok ? "on" : "could not be moved to");
+    }
+}
+
 /* ------------------------------------------------------------------------------------------- the real Kraken */
 
 #ifndef DF_NO_RTL
@@ -183,6 +327,7 @@ static void *reader(void *arg) {
 
     if (len < 4096) len = 65536;
 
+    pin_self(cpu_readers, rt_prio, "a reader");
     rtlsdr_reset_buffer(c->dev);
     rtlsdr_read_async(c->dev, on_read, c, BUFS, len);
     if (atomic_load(&streaming)) atomic_store(&c->ended, true);
@@ -547,6 +692,8 @@ static void *sock_thread(void *arg) {
 /* ------------------------------------------------------------------------------------------------- the worker */
 
 static df_engine_t eng;
+static int         nsrc_set = 1;       /* k: kept across the engine's rebuilds (a new rate), as the method is */
+static bool        fb_on;
 static int         blk_n;
 static uint8_t    *blk[DF_MAXCH];
 static int64_t     J;                           /* CH0's next block */
@@ -600,6 +747,8 @@ static void engine_setup(void) {
     eng.arr = arr;
     if (eng.arr.n > eng.nch) eng.arr.n = eng.nch;
     eng.method = (df_method_t)method;
+    eng.nsrc = nsrc_set;
+    eng.fb = fb_on;
     eng.sql_db = sql / 10.0;
     eng.cal_every_s = cal_every > 0 ? cal_every : -1;
     eng.user_off = user_off;
@@ -772,6 +921,8 @@ static void send_state(void) {
         s.arr_y_mm[m] = clamp16(arr.y[m] * 1000);
     }
     s.cpu_pct = (uint8_t)cpu_pct;
+    s.nsrc_set = (uint8_t)(eng.nsrc < 0 ? 0 : eng.nsrc ? eng.nsrc : 1);
+    s.fb = eng.fb;
     snprintf(s.why, sizeof(s.why), "%s", why[0] ? why : note);
     for (int m = 0; m < nch && m < DF_PROTO_MAXCH; m++) {
         df_ch_t *c = &s.ch[m];
@@ -831,6 +982,7 @@ static void send_estimate(const df_est_t *e, uint32_t seq) {
     d.papr_ddb = clamp16(e->doa.papr_db * 10);
     d.age_ds = last_good_at < 0 ? 0xffff : (uint16_t)fmin(65534, (t - last_good_at) * 10);
     d.npeaks = (uint8_t)(e->doa.npeaks > 3 ? 3 : e->doa.npeaks);
+    d.nsrc = (uint8_t)(e->doa.nsrc > 0 ? e->doa.nsrc : 1);
     for (int i = 0; i < d.npeaks; i++) d.peaks_ddeg[i] = ddeg(e->doa.peaks[i]);
     for (int m = 0; m < nch && m < DF_PROTO_MAXCH; m++) {
         d.ch_ddb[m] = clamp16(e->ch_db[m] * 10);
@@ -940,13 +1092,19 @@ static int apply(const char *c) {
             }
             break;
         case 'm':
-            if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0 && a <= 3) eng.method = (df_method_t)(method = (int)a);
+            if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0 && a < DF_METHODS) eng.method = (df_method_t)(method = (int)a);
             break;
         case 'q':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.sql_db = (sql = (int)a) / 10.0;
             break;
         case 'i':
             if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0) eng.cal_every_s = (cal_every = (int)a) > 0 ? cal_every : -1;
+            break;
+        case 'k':
+            if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0 && a <= 3) eng.nsrc = nsrc_set = (int)a ? (int)a : -1;
+            break;
+        case 'w':
+            if (sscanf(c + 1, "%lf", &a) == 1) eng.fb = fb_on = a != 0;
             break;
         case 'x':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.user_off = user_off = (unsigned)a & 0xff;
@@ -999,6 +1157,8 @@ static void wait_settings(void) {
 }
 
 static void run(bool print) {
+    pin_self(cpu_engine, 0, "the engine");
+    musb_irq_away();
     uint32_t seq = 0;
     double   last_st = 0, cpu_t = now_s(), cpu_wall = 0;
     struct timespec cpu0;
@@ -1136,10 +1296,13 @@ static void run(bool print) {
             if (print) print_est(&e);
             if (e.cal_wanted) calibrate(e.cal_wanted == 1);
 
-            /* the state twice a second, the CPU once a second */
+            /* the state twice a second, the CPU and gpsd's view once a second */
             if (t - last_st >= 0.5) {
+                static int odd;
+
                 last_st = t;
                 send_state();
+                if ((odd ^= 1)) send_gps();
             }
             if (t - cpu_t >= 1) {
                 struct timespec c1;
@@ -1172,7 +1335,7 @@ int main(int argc, char **argv) {
     double      a = 0, b = 0;
 
     df_array_uca(&arr, 5, 0.294);               /* the calculator at 433.92 MHz, s 0.5 */
-    while ((o = getopt(argc, argv, "FS:pf:s:g:t:a:m:i:n:DT:")) != -1) {
+    while ((o = getopt(argc, argv, "FS:pf:s:g:t:a:m:i:n:DT:C:")) != -1) {
         switch (o) {
             case 'F': front = true; break;
             case 'S': sock_name = optarg; break;
@@ -1193,12 +1356,19 @@ int main(int argc, char **argv) {
                 else df_array_uca(&arr, an, mm / 1000.0);
                 break;
             }
-            case 'm': method = atoi(optarg) & 3; break;
+            case 'm':
+                method = atoi(optarg);
+                if (method < 0 || method >= DF_METHODS) method = 0;
+                break;
             case 'i': cal_every = atoi(optarg); break;
             case 'n':
                 if ((n_open = atoi(optarg)) < 2 || n_open > NCH_KRAKEN) return 1;
                 break;
             case 'D': dither_on = true; break;
+            case 'C':
+                if (!strcmp(optarg, "off")) cores_on = false;
+                else if (sscanf(optarg, "%d,%d,%d", &cpu_readers, &cpu_engine, &rt_prio) < 2) return 1;
+                break;
             case 'T':
                 synth = true;
                 sscanf(optarg, "%lf,%lf,%d", &synth_bearing, &synth_rate, &synth_dead);
@@ -1253,6 +1423,10 @@ int main(int argc, char **argv) {
 
     pthread_t th;
     bool      th_on = ls >= 0 && pthread_create(&th, NULL, sock_thread, NULL) == 0;
+    pthread_t gth;
+
+    df_gps_init(&gps);
+    if (pthread_create(&gth, NULL, gps_thread, NULL) == 0) pthread_detach(gth);     /* gpsd, when it runs */
 
     logf_("started%s: %u Hz, target %+d Hz / %u Hz, %u S/s", synth ? " (synthetic)" : "", fc, f_off, bw, rate);
     run(print);

@@ -121,7 +121,8 @@ void df_array_calc(const df_array_t *a, double f_hz, double *s, double *res_deg)
 
 /* ------------------------------------------------------------------------------------------------- DoA */
 
-typedef enum { DF_MUSIC, DF_BARTLETT, DF_CAPON, DF_MEM } df_method_t;
+/* TNA: the thermal noise algorithm, 1 / a^H R^-2 a (ROADMAP.md, 6): sharper than Capon's peaks, as robust */
+typedef enum { DF_MUSIC, DF_BARTLETT, DF_CAPON, DF_MEM, DF_TNA, DF_METHODS } df_method_t;
 
 typedef struct {
     int            n;
@@ -142,14 +143,23 @@ typedef struct {
     double papr_db;             /* the spectrum's peak over its mean (KrakenRF's "confidence") */
     double width_deg;           /* Bartlett's half-power width at the bearing */
     int    npeaks;
-    double peaks[3];            /* other peaks within 6 dB */
+    double peaks[3];            /* one source: other peaks within 6 dB; several: the other sources' bearings */
+    int    nsrc;                /* sources taken (as asked, or MDL's count for 0) */
+    double sep_db;              /* the weakest of them over the noise (eigenvalues): several sources' gate */
     float  p_db[DF_GRID];       /* the method's spectrum, 0 dB at its peak */
 } df_doa_t;
 
 /* R: n x n Hermitian, row major. A line (ULA) is searched in front only, its mirror given; front_only puts its back
  * half at the floor in p_db */
-int df_doa(const double complex *R, const df_array_t *a, const df_steer_t *s, df_method_t m, int nsrc,
+/* The bearing from the covariance R. nsrc: the sources to look for (MUSIC's signal subspace, and with more than one
+ * their bearings in peaks[]); 0 or less: as many as df_count_sources finds (1-3). nsnap: the snapshots behind R */
+int df_doa(const double complex *R, const df_array_t *a, const df_steer_t *s, df_method_t m, int nsrc, int nsnap,
            bool front_only, df_doa_t *out);
+/* The sources in n eigenvalues (largest first): those above the widest gap of 6 dB or more, else 1 */
+int df_count_sources(const double *val, int n);
+/* Forward-backward averaging of R in place (n x n): for a ULA, whose reversed array is the same array; it
+ * decorrelates two coherent sources (multipath) */
+void df_fb(double complex *R, int n);
 
 /* Each channel left out in turn: the best Bartlett fit of the rest, at any bearing. One channel whose absence makes
  * the rest fit (a slip, or a bad cable) stands out */
@@ -167,8 +177,9 @@ typedef struct {
     double      f, bw;                  /* the target: offset from the centre, bandwidth */
     df_array_t  arr;
     df_method_t method;
-    int         nsrc;
+    int         nsrc;                   /* sources: 1 (0 unset: 1), 2, 3, or -1 AUTO (MDL) */
     bool        front_only;
+    bool        fb;                     /* forward-backward averaging (a ULA: coherent sources, multipath) */
     double      sql_db;                 /* the squelch: target over the floor (default 8) */
     double      eig_min_db;             /* one source across the array (default 6) */
     double      fit_min;                /* a plane wave explains it (default 0.5) */

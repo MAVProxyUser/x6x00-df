@@ -223,13 +223,16 @@ int df_engine_block(df_engine_t *e, const uint8_t *const iq[], int n, df_est_t *
         arr = &e->sub;
         st = &e->sub_steer;
     }
-    bool doa_ok = nu >= need && k > nu && df_doa(R, arr, st, e->method, e->nsrc, e->front_only, &o->doa) == 0;
+    if (e->fb && arr->kind == DF_ULA && nu == nch) df_fb(R, nu);   /* a whole ULA only: one with a gap is not uniform */
+    bool doa_ok = nu >= need && k > nu && df_doa(R, arr, st, e->method, e->nsrc, k, e->front_only, &o->doa) == 0;
 
     o->have_doa = doa_ok;
 
     /* the gate */
     e->open_run = o->level_db >= e->sql_db ? e->open_run + 1 : 0;
-    o->gate = e->have_cal && doa_ok && e->open_run >= 3 && o->doa.eig_db >= e->eig_min_db && o->doa.fit >= e->fit_min;
+    o->gate = e->have_cal && doa_ok && e->open_run >= 3 &&
+              (o->doa.nsrc > 1 ? o->doa.sep_db >= e->eig_min_db     /* several: the weakest clear of the noise */
+                               : o->doa.eig_db >= e->eig_min_db && o->doa.fit >= e->fit_min);
 
     /* uncertainty: the statistics of the peak, or the spread of the last bearings if wider; a degree at least */
     if (o->gate) {

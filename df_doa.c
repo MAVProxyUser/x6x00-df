@@ -212,7 +212,31 @@ static bool in_front(int g) {
     return g <= DF_GRID / 4 || g >= 3 * DF_GRID / 4;
 }
 
-int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st, df_method_t m, int nsrc,
+/* The sources: the eigenvalues above the widest gap between neighbours, when it is 6 dB or more (else one). MDL (Wax
+ * and Kailath) was tried first and counted three in every case on the test's made-up Kraken: its channels' noise
+ * differs by a few dB, as a real Kraken's does after calibration, and with thousands of snapshots MDL reads that
+ * spread as sources. The gap stands 19-22 dB for one or two transmitters there, against 1-2 dB of noise spread */
+int df_count_sources(const double *val, int n) {
+    int    best = 1;
+    double wide = 0;
+
+    for (int i = 1; i < n; i++) {
+        double g = 10 * log10((val[i - 1] > 1e-30 ? val[i - 1] : 1e-30) / (val[i] > 1e-30 ? val[i] : 1e-30));
+
+        if (g > wide) wide = g, best = i;
+    }
+    return wide >= 6 ? best : 1;
+}
+
+void df_fb(double complex *R, int n) {
+    double complex t[DF_MAXCH * DF_MAXCH];
+
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) t[i * n + j] = 0.5 * (R[i * n + j] + conj(R[(n - 1 - i) * n + (n - 1 - j)]));
+    memcpy(R, t, sizeof(t[0]) * (size_t)(n * n));
+}
+
+int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st, df_method_t m, int nsrc, int nsnap,
            bool front_only, df_doa_t *o) {
     int            n = arr->n;
     double         val[DF_MAXCH], trace = 0, P[DF_GRID], B[DF_GRID];
@@ -224,10 +248,13 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
     if (n < 2 || n > DF_MAXCH || st->n != n) return -1;
     for (int i = 0; i < n; i++) trace += creal(R[i * n + i]);
     if (!(trace > 0)) return -1;
-    if (nsrc < 1) nsrc = 1;
-    if (nsrc > n - 1) nsrc = n - 1;
-
     df_eigh(R, n, val, V);
+    (void)nsnap;
+    if (nsrc < 1) nsrc = df_count_sources(val, n);
+    if (nsrc > 3) nsrc = 3;                         /* the bearings the protocol carries, and plenty for 5 elements */
+    if (nsrc > n - 1) nsrc = n - 1;
+    o->nsrc = nsrc;
+    o->sep_db = 10 * log10(val[nsrc - 1] / (val[nsrc] > trace * 1e-12 ? val[nsrc] : trace * 1e-12));
     double noise = 0;
 
     for (int i = nsrc; i < n; i++) noise += val[i];
@@ -238,14 +265,15 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
 
     o->snr_db = 10 * log10(snr > 1e-6 ? snr : 1e-6);
 
-    if (m == DF_CAPON || m == DF_MEM) {                     /* R^-1, loaded */
+    if (m == DF_CAPON || m == DF_MEM || m == DF_TNA) {      /* R^-1, loaded (TNA: R^-2) */
         double load = 1e-3 * trace / n;
+        int    pw = m == DF_TNA ? 2 : 1;
 
         for (int i = 0; i < n; i++)
             for (int j = 0; j < n; j++) {
                 double complex s = 0;
 
-                for (int k = 0; k < n; k++) s += V[i * n + k] * conj(V[j * n + k]) / (val[k] + load);
+                for (int k = 0; k < n; k++) s += V[i * n + k] * conj(V[j * n + k]) / pow(val[k] + load, pw);
                 Ri[i * n + j] = s;
             }
     }
@@ -255,7 +283,8 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
         B[g] = quad(R, n, a);
         switch (m) {
             case DF_BARTLETT: P[g] = B[g]; break;
-            case DF_CAPON: P[g] = 1 / fmax(quad(Ri, n, a), 1e-30); break;
+            case DF_CAPON:
+            case DF_TNA: P[g] = 1 / fmax(quad(Ri, n, a), 1e-30); break;
             case DF_MEM: {
                 double complex s = 0;
 
@@ -316,15 +345,26 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
     }
     o->width_deg = w * 360.0 / DF_GRID;
 
-    /* other peaks within 6 dB, away from the main one (and a line's mirror) */
-    double keep = fmax(o->width_deg / 2, 10);
+    /* One source: other peaks within 6 dB, away from the main one (and a line's mirror). Several: the strongest
+     * nsrc-1 other peaks down to 25 dB, the other sources' bearings, strongest first */
+    double keep = fmax(o->width_deg / 2, 10), floor_db = nsrc > 1 ? -25 : -6;
+    int    want = nsrc > 1 ? nsrc - 1 : 3;
+    double pk[DF_GRID], hdb[DF_GRID];
+    int    np = 0;
 
-    for (int g = 0; g < DF_GRID && o->npeaks < 3; g++) {
-        if (o->p_db[g] < -6 || o->p_db[g] < o->p_db[wrapi(g - 1)] || o->p_db[g] <= o->p_db[wrapi(g + 1)]) continue;
+    for (int g = 0; g < DF_GRID; g++) {
+        if (o->p_db[g] < floor_db || o->p_db[g] < o->p_db[wrapi(g - 1)] || o->p_db[g] <= o->p_db[wrapi(g + 1)]) continue;
         double d0 = fabs(fmod(g * 360.0 / DF_GRID - o->bearing + 540, 360) - 180);
         double d1 = o->mirror >= 0 ? fabs(fmod(g * 360.0 / DF_GRID - o->mirror + 540, 360) - 180) : 999;
 
-        if (d0 > keep && d1 > keep) o->peaks[o->npeaks++] = g * 360.0 / DF_GRID;
+        if (d0 > keep && d1 > keep) pk[np] = g * 360.0 / DF_GRID, hdb[np++] = o->p_db[g];
     }
+    if (nsrc > 1)                                   /* strongest first */
+        for (int i = 1; i < np; i++)
+            for (int j = i; j > 0 && hdb[j] > hdb[j - 1]; j--) {
+                double t = hdb[j]; hdb[j] = hdb[j - 1]; hdb[j - 1] = t;
+                t = pk[j]; pk[j] = pk[j - 1]; pk[j - 1] = t;
+            }
+    for (int i = 0; i < np && o->npeaks < want && o->npeaks < 3; i++) o->peaks[o->npeaks++] = pk[i];
     return 0;
 }

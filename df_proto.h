@@ -9,6 +9,7 @@
  *    DFST  the state, the settings, every channel's calibration      on any change and twice a second
  *    DFDO  one estimate: bearing, its quality, every channel live    every block (10 a second)
  *    DFSP  CH0's spectrum across the whole passband                  every block
+ *    DFGP  gpsd: the fix and the heading the bearings may take       once a second (all 0 / -1 without gpsd)
  *
  *  GUI to daemon: one text command per packet, ASCII, no newline needed:
  *    f HZ                  the tuners' centre
@@ -17,10 +18,12 @@
  *    g TENTHS              tuner gain in tenths of a dB (the R820T's steps), the same on every channel
  *    a KIND N SIZE_MM      the array: KIND uca|ula, N 2-8, the circle's radius or the line's spacing in mm
  *    a custom N X0 Y0 ...  every element's x (forward) and y (left) in mm, ANT 0 first
- *    m METHOD              0 MUSIC, 1 Bartlett, 2 Capon, 3 MEM
+ *    m METHOD              0 MUSIC, 1 Bartlett, 2 Capon, 3 MEM, 4 TNA
  *    q TENTHS              the squelch: the target this many tenths of a dB over the floor
  *    i SECONDS             calibrate this often (in a gap in the signal), 0 only when asked
  *    x MASK                channels the user leaves out of the bearing (bit m: channel m)
+ *    k N                   the sources to look for: 1 (default), 2, 3, 0 AUTO (counted from the eigenvalues)
+ *    w 0|1                 forward-backward averaging (a ULA, for a coherent pair such as multipath)
  *    c                     calibrate now
  *    Q                     end (the sticks closed, the noise source off)
  */
@@ -79,7 +82,7 @@ typedef struct {
     uint8_t  state;             /* DF_ST_* */
     uint8_t  nch;               /* channels streaming (5 for a Kraken) */
     uint8_t  synth;             /* 1: a synthetic test source, no sticks */
-    uint8_t  method;            /* 0-3 */
+    uint8_t  method;            /* 0-4 (m METHOD) */
     uint8_t  arr_kind;          /* 0 UCA, 1 ULA, 2 custom */
     uint8_t  arr_n;             /* elements */
     uint8_t  user_off;          /* the x MASK */
@@ -99,7 +102,9 @@ typedef struct {
     int16_t  arr_x_mm[DF_PROTO_MAXCH];
     int16_t  arr_y_mm[DF_PROTO_MAXCH];
     uint8_t  cpu_pct;           /* the daemon's share of one core */
-    uint8_t  pad[3];
+    uint8_t  nsrc_set;          /* k: the sources asked for, 0 AUTO */
+    uint8_t  fb;                /* w: forward-backward averaging on */
+    uint8_t  pad;
     char     why[64];           /* the last failure, "" none */
     df_ch_t  ch[DF_PROTO_MAXCH];
 } df_st_msg_t;
@@ -120,8 +125,8 @@ typedef struct {
     int16_t  papr_ddb;
     uint16_t age_ds;            /* tenths of a second since the bearing was last good (0 now) */
     uint8_t  npeaks;
-    uint8_t  pad;
-    int16_t  peaks_ddeg[3];     /* other peaks within 6 dB */
+    uint8_t  nsrc;              /* the sources taken: 1, or 2-3 with peaks_ddeg the others' bearings */
+    int16_t  peaks_ddeg[3];     /* one source: other peaks within 6 dB; several: the other sources, strongest first */
     int16_t  ch_ddb[DF_PROTO_MAXCH];    /* the target's power on each channel, tenths of dB over that channel's floor */
     uint8_t  ch_clip_pm[DF_PROTO_MAXCH];/* bytes at 0 or 255, per thousand (255 = 25.5 % or more) */
     uint8_t  p[360];            /* the method's spectrum per degree: 255 at its peak, 0 at 40 dB under or less */
@@ -136,5 +141,18 @@ typedef struct {
     uint16_t n;                 /* DF_PROTO_SPEC */
     uint8_t  db[DF_PROTO_SPEC]; /* 0.5 dB a step over floor - 20 dB: v = (dB - floor + 20) * 2, clamped 0-255 */
 } df_sp_msg_t;
+
+/* gpsd's view (df_gps.h): the GUI turns bearings into compass bearings with head_ddeg when head_src says there is one,
+ * else with the heading set by hand */
+typedef struct {
+    char     tag[4];            /* "DFGP" */
+    uint8_t  gpsd;              /* 1: gpsd answers */
+    uint8_t  mode;              /* the fix: 0-1 none, 2 2D, 3 3D */
+    uint8_t  head_src;          /* DF_HEAD_*: 0 none, 1 the course while moving (or held after), 2 a compass */
+    uint8_t  pad;
+    int16_t  head_ddeg;         /* tenths of a degree 0-3599, -1 none */
+    uint16_t speed_cms;         /* cm/s, 0xffff unknown */
+    int32_t  lat_e7, lon_e7;    /* degrees x 1e7 (0 with no fix) */
+} df_gp_msg_t;
 
 #pragma pack(pop)
