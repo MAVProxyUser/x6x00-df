@@ -31,6 +31,9 @@ Done 2026-11-17: readers on CPU2 at SCHED_FIFO 10, the engine on CPU3, the musb 
 
 ## 2. Tuning page I, and following a radio
 
+Done 2026-11-17 (GoldCorpHF 9a4bc55): F1 TUNE with FOLLOW A or B, the BAND keys on the presets; a typed frequency
+came with the web page instead (the radio has no keypad for it).
+
 - A band key on page I itself (today the presets hide in F2 ARRAY's panel), and the frequency typed with a keyboard.
 - FOLLOW: OFF, A or B. Following, page I takes the frequency the X6200 (A) or B's SDR is tuned to, as it changes
   (after the dial rests half a second: each retune means a calibration, about 0.5 s), so a signal found on A or B is
@@ -38,6 +41,11 @@ Done 2026-11-17: readers on CPU2 at SCHED_FIFO 10, the engine on CPU3, the musb 
 - In GoldCorpHF's GUI (page I), with the daemon's retune as it is.
 
 ## 3. A web page for the Kraken (GoldCorpHF's web configurator)
+
+First version done 2026-11-17 (GoldCorpHF, Remote > Direction finder): every view and setting above but the custom
+layout drawn and the bearing log (they come with 5 and 7) and the IQ server's clients (9). Built through the GUI's
+configurator socket rather than a second client here: the GUI owns the Kraken and page I's settings, so one set of
+settings serves both, and a page polling it four times a second costs nothing worth measuring.
 
 - A Direction finder page in the radio's web configurator: the compass, the spectrum and the bearings' waterfall at
   the browser's size, every channel's level and state, the targets; tuning (a frequency typed, the band presets,
