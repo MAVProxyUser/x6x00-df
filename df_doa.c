@@ -8,6 +8,9 @@
  *  R = E[x x^H] (5x5). Spectra on a one-degree grid, the peak refined by a parabola through its neighbours:
  *    Bartlett a^H R a; MUSIC 1 / (n - sum over the signal eigenvectors |e^H a|^2) (= 1 / a^H En En^H a);
  *    Capon 1 / a^H R^-1 a; MEM 1 / |a^H R^-1 e_0|^2 (R^-1 from the eigenvalues, loaded by 1e-3 trace / n).
+ *  ROOT-MUSIC (a whole uniform line): element k at y = -k d sees a_k = z^k, z = exp(j 2 pi d sin t / lambda), so
+ *    a^H C a with C = I - Es Es^H is sum over m of c_m z^m, c_m the sum of C's m-th diagonal; its roots inside the unit
+ *    circle and nearest it are the sources (Barabell 1983), t = asin(arg z lambda / (2 pi d)), in front.
  *  The fit: Bartlett at the bearing over n trace R, 1 for one clean plane wave from there.
  */
 
@@ -236,6 +239,112 @@ void df_fb(double complex *R, int n) {
     memcpy(R, t, sizeof(t[0]) * (size_t)(n * n));
 }
 
+int df_smooth(const double complex *R, int n, int p, double complex *Rs) {
+    int L = n - p + 1;
+
+    if (p < 1 || L < 2) return -1;
+    for (int i = 0; i < L; i++)
+        for (int j = 0; j < L; j++) {
+            double complex s = 0;
+
+            for (int q = 0; q < p; q++) s += R[(i + q) * n + (j + q)];
+            Rs[i * L + j] = s / p;
+        }
+    return L;
+}
+
+bool df_uniform_line(const df_array_t *a) {
+    if (a->kind != DF_ULA || a->n < 2 || !(a->size > 0)) return false;
+    for (int k = 0; k < a->n; k++)
+        if (fabs(a->x[k]) > 1e-9 || fabs(a->y[k] - (a->y[0] - k * a->size)) > 1e-9) return false;
+    return true;
+}
+
+int df_poly_roots(const double complex *c, int d, double complex *z) {
+    double complex a[2 * DF_MAXCH];
+    double         big = 0;
+
+    if (d < 1 || d > 2 * (DF_MAXCH - 1)) return -1;
+    while (d > 0 && cabs(c[d]) < 1e-14 * (cabs(c[0]) + 1e-300)) d--;    /* a top that is nothing */
+    if (d < 1) return -1;
+    for (int k = 0; k <= d; k++) a[k] = c[k] / c[d];                       /* monic */
+    for (int k = 0; k < d; k++) big = fmax(big, cabs(a[k]));
+    if (!isfinite(big)) return -1;
+    for (int i = 0; i < d; i++) z[i] = cexp(I * (2 * M_PI * i / d + 0.4));  /* a start round the unit circle */
+    for (int it = 0; it < 200; it++) {
+        double moved = 0;
+
+        for (int i = 0; i < d; i++) {
+            double complex p = 1, dp = 0, s = 0;
+
+            for (int k = d - 1; k >= 0; k--) dp = dp * z[i] + p, p = p * z[i] + a[k];     /* Horner, with p' */
+            if (cabs(p) == 0) continue;
+            for (int j = 0; j < d; j++)
+                if (j != i) s += 1 / (z[i] - z[j]);
+            double complex w = p / dp, dz = w / (1 - w * s);
+
+            if (!isfinite(creal(dz)) || !isfinite(cimag(dz))) continue;
+            z[i] -= dz;
+            moved = fmax(moved, cabs(dz) / fmax(cabs(z[i]), 1e-12));
+        }
+        if (moved < 1e-13) break;
+    }
+    return d;
+}
+
+/* ROOT-MUSIC on a whole uniform line: up to want bearings (degrees, in front), the root nearest the unit circle first;
+ * returns how many */
+static int root_music(const double complex *V, int n, int nsrc, double d, double lambda, int want, double *brg) {
+    double complex C[DF_MAXCH * DF_MAXCH], c[2 * DF_MAXCH], z[2 * DF_MAXCH];
+    int            got = 0;
+
+    for (int i = 0; i < n; i++)
+        for (int j = 0; j < n; j++) {
+            double complex s = i == j ? 1 : 0;
+
+            for (int k = 0; k < nsrc; k++) s -= V[i * n + k] * conj(V[j * n + k]);
+            C[i * n + j] = s;
+        }
+    for (int m = -(n - 1); m <= n - 1; m++) {
+        double complex s = 0;
+
+        for (int i = 0; i < n; i++) {
+            int j = i + m;
+
+            if (j >= 0 && j < n) s += C[i * n + j];
+        }
+        c[m + n - 1] = s;
+    }
+    int nr = df_poly_roots(c, 2 * (n - 1), z);
+
+    if (nr < 1) return 0;
+    bool used[2 * DF_MAXCH] = {false};
+
+    while (got < want) {
+        int    best = -1;
+        double bd = 1e9;
+
+        for (int i = 0; i < nr; i++) {                  /* inside (or on) the circle, the nearest to it */
+            double r = cabs(z[i]);
+
+            if (used[i] || r > 1 + 1e-6 || r < 0.2 || 1 - r >= bd) continue;
+            bd = 1 - r, best = i;
+        }
+        if (best < 0) break;
+        used[best] = true;
+        double s = carg(z[best]) * lambda / (2 * M_PI * d);
+
+        if (s > 1) s = 1;
+        if (s < -1) s = -1;
+        double b = wrapd(asin(s) * 180 / M_PI);
+        bool   dup = false;
+
+        for (int k = 0; k < got; k++) dup |= fabs(fmod(b - brg[k] + 540, 360) - 180) < 1;   /* a split double root */
+        if (!dup) brg[got++] = b;
+    }
+    return got;
+}
+
 int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st, df_method_t m, int nsrc, int nsnap,
            bool front_only, df_doa_t *o) {
     int            n = arr->n;
@@ -320,6 +429,10 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
     if (delta > 0.5) delta = 0.5;
     if (delta < -0.5) delta = -0.5;
     o->bearing = wrapd((at + delta) * 360.0 / DF_GRID);
+    double rb[3];
+    int    nrb = m == DF_ROOTMUSIC && df_uniform_line(arr) ? root_music(V, n, nsrc, arr->size, st->lambda, nsrc, rb) : 0;
+
+    if (nrb >= 1) o->bearing = rb[0], o->rooted = true;     /* the grid's peak gives way to the root */
     if (line) o->mirror = wrapd(180 - o->bearing);
     o->papr_db = 10 * log10(pmax / (sum / DF_GRID));
     for (int g = 0; g < DF_GRID; g++) {
@@ -366,5 +479,9 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
                 t = pk[j]; pk[j] = pk[j - 1]; pk[j - 1] = t;
             }
     for (int i = 0; i < np && o->npeaks < want && o->npeaks < 3; i++) o->peaks[o->npeaks++] = pk[i];
+    if (o->rooted && nsrc > 1 && nrb == nsrc) {                 /* the other sources from their roots too */
+        o->npeaks = 0;
+        for (int i = 1; i < nrb; i++) o->peaks[o->npeaks++] = rb[i];
+    }
     return 0;
 }

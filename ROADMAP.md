@@ -77,8 +77,13 @@ page I turned north up, its HEADING row `IN USE: GPS COURSE 135 (GPSD)`.
 
 ## 6. More methods
 
-TNA done; several sources (2, 3, AUTO from the eigenvalues' widest gap: MDL counted noise as sources) and
-forward-backward averaging done, in the host checks; ROOT-MUSIC and spatial smoothing to come.
+Done 2026-11-17, all in the host checks: TNA; several sources (2, 3, AUTO from the eigenvalues' widest gap: MDL
+counted noise as sources); forward-backward averaging; spatial smoothing (`o 2|3`, the line's overlapping subarrays,
+with FB a coherent pair of sources told apart: the test's multipath at 340 and 30 degrees found within 0.1, which
+MUSIC alone cannot); ROOT-MUSIC on a whole ULA (method 5: MUSIC's polynomial's roots by Aberth's iteration, 23.37
+degrees found as 23.370 where the one-degree grid's MUSIC gives 23.21). For a UCA, ROOT-MUSIC stays MUSIC: the
+phase-mode transform needs more elements than five (with five, its aliased modes are about half the size of the ones
+kept at a spacing of half a wavelength), so it would be worse than the grid it replaces.
 
 - **TNA** (thermal noise algorithm, `1 / a^H R^-2 a`): a step from Capon, which already inverts R.
 - **More than one source**: the number of sources from the eigenvalues (MDL), MUSIC's noise subspace of M-K vectors,

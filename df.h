@@ -121,8 +121,10 @@ void df_array_calc(const df_array_t *a, double f_hz, double *s, double *res_deg)
 
 /* ------------------------------------------------------------------------------------------------- DoA */
 
-/* TNA: the thermal noise algorithm, 1 / a^H R^-2 a (ROADMAP.md, 6): sharper than Capon's peaks, as robust */
-typedef enum { DF_MUSIC, DF_BARTLETT, DF_CAPON, DF_MEM, DF_TNA, DF_METHODS } df_method_t;
+/* TNA: the thermal noise algorithm, 1 / a^H R^-2 a (ROADMAP.md, 6): sharper than Capon's peaks, as robust.
+ * ROOT-MUSIC: on a whole uniform line, the bearings from the roots of MUSIC's polynomial (no grid); on any other
+ * array it is MUSIC */
+typedef enum { DF_MUSIC, DF_BARTLETT, DF_CAPON, DF_MEM, DF_TNA, DF_ROOTMUSIC, DF_METHODS } df_method_t;
 
 typedef struct {
     int            n;
@@ -145,6 +147,7 @@ typedef struct {
     int    npeaks;
     double peaks[3];            /* one source: other peaks within 6 dB; several: the other sources' bearings */
     int    nsrc;                /* sources taken (as asked, or MDL's count for 0) */
+    bool   rooted;              /* ROOT-MUSIC: the bearing (and the other sources') from the polynomial's roots */
     double sep_db;              /* the weakest of them over the noise (eigenvalues): several sources' gate */
     float  p_db[DF_GRID];       /* the method's spectrum, 0 dB at its peak */
 } df_doa_t;
@@ -160,6 +163,14 @@ int df_count_sources(const double *val, int n);
 /* Forward-backward averaging of R in place (n x n): for a ULA, whose reversed array is the same array; it
  * decorrelates two coherent sources (multipath) */
 void df_fb(double complex *R, int n);
+/* Spatial smoothing of a ULA's R (n x n): the mean of its p overlapping subarrays' covariances, each n - p + 1
+ * elements, into Rs; returns n - p + 1. With FB after it, it decorrelates up to 2p coherent sources, at the cost of
+ * the aperture (the subarray's) */
+int df_smooth(const double complex *R, int n, int p, double complex *Rs);
+/* The roots of c[0] + c[1] z + ... + c[d] z^d, d <= 2 (DF_MAXCH - 1) (Aberth's iteration); returns d, or -1 */
+int df_poly_roots(const double complex *c, int d, double complex *z);
+/* An array of elements on a line at its spacing in order (a ULA, no element left out) */
+bool df_uniform_line(const df_array_t *a);
 
 /* Each channel left out in turn: the best Bartlett fit of the rest, at any bearing. One channel whose absence makes
  * the rest fit (a slip, or a bad cable) stands out */
@@ -180,6 +191,7 @@ typedef struct {
     int         nsrc;                   /* sources: 1 (0 unset: 1), 2, 3, or -1 AUTO (MDL) */
     bool        front_only;
     bool        fb;                     /* forward-backward averaging (a ULA: coherent sources, multipath) */
+    int         smooth;                 /* spatial smoothing: subarrays (0 or 1 off, 2, 3), a whole ULA only */
     double      sql_db;                 /* the squelch: target over the floor (default 8) */
     double      eig_min_db;             /* one source across the array (default 6) */
     double      fit_min;                /* a plane wave explains it (default 0.5) */
@@ -207,6 +219,9 @@ typedef struct {
     unsigned       sub_mask;            /* the elements sub and sub_steer were made for */
     df_array_t     sub;
     df_steer_t     sub_steer;
+    int            ss_p;                /* the subarrays ss and ss_steer were made for (smoothing) */
+    df_array_t     ss;
+    df_steer_t     ss_steer;
     float          spec_db[1024];       /* CH0's last spectrum, dBFS, lowest frequency first */
     float          win[1024];           /* Hann */
     double         floor_db;            /* its median bin */

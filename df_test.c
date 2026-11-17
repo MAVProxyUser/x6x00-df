@@ -663,6 +663,162 @@ static void test_fb_ula(void) {
           "before, %.1f after)", before, after);
 }
 
+/* Aberth's roots: a polynomial made from known roots gives them back, a close pair across the unit circle as
+ * ROOT-MUSIC's own among them */
+static void test_roots(void) {
+    double complex r[6] = {0.5, 0.3 + 0.8 * I, -1.2, 2 * I, 0.99 * cexp(I * 0.4), 1.0101 * cexp(I * 0.4)};
+    double complex c[7] = {1}, z[6];
+    int            d = 0;
+    double         worst = 0;
+
+    for (int k = 0; k < 6; k++, d++) {                  /* times (z - r_k) */
+        for (int j = d + 1; j > 0; j--) c[j] = c[j - 1] - r[k] * c[j];
+        c[0] = -r[k] * c[0];
+    }
+    int got = df_poly_roots(c, 6, z);
+
+    for (int k = 0; k < 6; k++) {
+        double best = 1e9;
+
+        for (int i = 0; i < got; i++) best = fmin(best, cabs(z[i] - r[k]));
+        worst = fmax(worst, best);
+    }
+    check(got == 6 && worst < 1e-8, "polynomial roots: %d of 6, the worst %.1e off", got, worst);
+}
+
+/* R = sum of p_s a_s a_s^H, plus the noise on the diagonal */
+static void make_r(const df_array_t *arr, double lambda, const double *brg, const double *pw, int ns, double noise,
+                   double complex *R) {
+    int n = arr->n;
+
+    for (int i = 0; i < n * n; i++) R[i] = 0;
+    for (int s = 0; s < ns; s++) {
+        double complex a[DF_MAXCH];
+
+        df_steer_at(arr, lambda, brg[s], a);
+        for (int i = 0; i < n; i++)
+            for (int j = 0; j < n; j++) R[i * n + j] += pw[s] * a[i] * conj(a[j]);
+    }
+    for (int i = 0; i < n; i++) R[i * n + i] += noise;
+}
+
+static bool pair_found(const df_doa_t *o, double b1, double b2, double tol) {
+    double other = o->npeaks ? o->peaks[0] : -999;
+
+    return (angdiff(o->bearing, b1) < tol && angdiff(other, b2) < tol) || (angdiff(o->bearing, b2) < tol && angdiff(other, b1) < tol);
+}
+
+/* ROOT-MUSIC on a ULA-5: one source off the grid, two at once, through the engine; on a circle it is MUSIC */
+static void test_root_music(void) {
+    double         lambda = DF_C / (FC + FOFF), b1[1] = {23.37}, p1[1] = {10}, b2[2] = {340, 30}, p2[2] = {10, 5};
+    df_array_t     arr, uca;
+    df_steer_t     st, su;
+    df_doa_t       o, om;
+    double complex R[25];
+
+    df_array_ula(&arr, 5, 0.5 * lambda);
+    df_steer_make(&st, &arr, lambda);
+    make_r(&arr, lambda, b1, p1, 1, 1, R);
+    df_doa(R, &arr, &st, DF_ROOTMUSIC, 1, 1000, true, &o);
+    df_doa(R, &arr, &st, DF_MUSIC, 1, 1000, true, &om);
+    check(o.rooted && angdiff(o.bearing, 23.37) < 0.01 && angdiff(o.mirror, 156.63) < 0.01,
+          "ROOT-MUSIC, one source at 23.37 on a ULA-5: %.3f (MUSIC on the grid %.3f)", o.bearing, om.bearing);
+
+    make_r(&arr, lambda, b2, p2, 2, 1, R);
+    df_doa(R, &arr, &st, DF_ROOTMUSIC, 2, 1000, true, &o);
+    check(o.rooted && pair_found(&o, 340, 30, 0.05), "ROOT-MUSIC, two sources (340, 30): %.3f and %.3f", o.bearing,
+          o.npeaks ? o.peaks[0] : -1);
+
+    df_array_uca(&uca, 5, 0.5 * lambda / (2 * sin(M_PI / 5)));
+    df_steer_make(&su, &uca, lambda);
+    make_r(&uca, lambda, b1, p1, 1, 1, R);
+    df_doa(R, &uca, &su, DF_ROOTMUSIC, 1, 1000, false, &o);
+    df_doa(R, &uca, &su, DF_MUSIC, 1, 1000, false, &om);
+    check(!o.rooted && o.bearing == om.bearing, "ROOT-MUSIC on a UCA-5 is MUSIC: %.3f and %.3f", o.bearing, om.bearing);
+
+    hw_t        hw[5];
+    df_cal_t    cal;
+    df_engine_t e;
+    df_est_t    est;
+
+    hw_random(hw, 5);
+    calibrate(hw, 5, &cal);
+    src_t     s = nfm(37.4, 20);
+    uint8_t **ch = gen(hw, &arr, &s, 1, START * 2 + 6 * BLOCK, 0);
+
+    engine_for(&e, &arr);
+    e.method = DF_ROOTMUSIC;
+    df_engine_set_cal(&e, &cal);
+    run(&e, ch, &cal, 0, 5, &est);
+    check(est.gate && est.doa.rooted && angdiff(est.doa.bearing, 37.4) < 0.5, "ROOT-MUSIC in the engine, ULA-5 at 37.4: %.2f",
+          est.doa.bearing);
+    df_engine_free(&e);
+    free_ch(ch, 5);
+}
+
+/* Spatial smoothing and FB on a ULA-5: a source and its coherent copy (multipath: the same signal from two bearings),
+ * which MUSIC alone cannot tell apart */
+static void test_smoothing(void) {
+    double         lambda = DF_C / (FC + FOFF);
+    df_array_t     arr, a4;
+    df_steer_t     st, s4;
+    df_doa_t       o;
+    double complex R[25], Rs[25], v[5], a1[5], a2[5];
+    double         val[5];
+    double complex V[25];
+
+    df_array_ula(&arr, 5, 0.5 * lambda);
+    df_steer_make(&st, &arr, lambda);
+    df_steer_at(&arr, lambda, 340, a1);
+    df_steer_at(&arr, lambda, 30, a2);
+    for (int i = 0; i < 5; i++) v[i] = a1[i] + 0.8 * cexp(I * 0.7) * a2[i];
+    for (int i = 0; i < 5; i++)
+        for (int j = 0; j < 5; j++) R[i * 5 + j] = v[i] * conj(v[j]) + (i == j ? 0.01 : 0);
+    df_doa(R, &arr, &st, DF_ROOTMUSIC, 2, 1000, true, &o);
+    bool alone = pair_found(&o, 340, 30, 2);
+    int  L = df_smooth(R, 5, 2, Rs);
+
+    df_fb(Rs, L);
+    df_eigh(Rs, L, val, V);
+    a4 = arr;
+    a4.n = L;
+    df_steer_make(&s4, &a4, lambda);
+    df_doa(Rs, &a4, &s4, DF_ROOTMUSIC, 2, 1000, true, &o);
+    check(L == 4 && !alone && pair_found(&o, 340, 30, 0.5) && 10 * log10(val[1] / val[2]) > 10,
+          "smoothing (2 subarrays) and FB: a coherent pair at 340 and 30 found, %.2f and %.2f (2nd eigenvalue %.1f dB over "
+          "the noise; without, %s)", o.bearing, o.npeaks ? o.peaks[0] : -1, 10 * log10(val[1] / val[2]),
+          alone ? "found too" : "not found");
+
+    /* through the engine: the same signal from both bearings, the copy 2 dB weaker */
+    hw_t     hw[5];
+    df_cal_t cal;
+    src_t    s[2] = {nfm(340, 22), nfm(30, 20)};
+
+    hw_random(hw, 5);
+    calibrate(hw, 5, &cal);
+    uint8_t **ch = gen(hw, &arr, s, 2, START * 2 + 6 * BLOCK, 0);
+
+    for (int mode = 0; mode < 2; mode++) {
+        df_engine_t e;
+        df_est_t    est;
+
+        engine_for(&e, &arr);
+        e.method = DF_ROOTMUSIC;
+        e.nsrc = 2;
+        e.smooth = mode ? 2 : 0;
+        e.fb = mode;
+        df_engine_set_cal(&e, &cal);
+        run(&e, ch, &cal, 0, 5, &est);
+        bool both = pair_found(&est.doa, 340, 30, 3);
+
+        check(mode ? both && est.gate : !both || !est.gate, "multipath in the engine, %s: %.1f and %.1f (340, 30)%s",
+              mode ? "smoothing and FB" : "neither", est.doa.bearing, est.doa.npeaks ? est.doa.peaks[0] : -1,
+              est.gate ? "" : ", gate shut");
+        df_engine_free(&e);
+    }
+    free_ch(ch, 5);
+}
+
 int main(int argc, char **argv) {
     verbose = argc > 1 && !strcmp(argv[1], "-v");
     test_calc();
@@ -678,6 +834,9 @@ int main(int argc, char **argv) {
     test_gps();
     test_two_sources();
     test_fb_ula();
+    test_roots();
+    test_root_music();
+    test_smoothing();
     printf("df_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

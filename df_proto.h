@@ -18,12 +18,13 @@
  *    g TENTHS              tuner gain in tenths of a dB (the R820T's steps), the same on every channel
  *    a KIND N SIZE_MM      the array: KIND uca|ula, N 2-8, the circle's radius or the line's spacing in mm
  *    a custom N X0 Y0 ...  every element's x (forward) and y (left) in mm, ANT 0 first
- *    m METHOD              0 MUSIC, 1 Bartlett, 2 Capon, 3 MEM, 4 TNA
+ *    m METHOD              0 MUSIC, 1 Bartlett, 2 Capon, 3 MEM, 4 TNA, 5 ROOT-MUSIC (a whole ULA; else MUSIC)
  *    q TENTHS              the squelch: the target this many tenths of a dB over the floor
  *    i SECONDS             calibrate this often (in a gap in the signal), 0 only when asked
  *    x MASK                channels the user leaves out of the bearing (bit m: channel m)
  *    k N                   the sources to look for: 1 (default), 2, 3, 0 AUTO (counted from the eigenvalues)
  *    w 0|1                 forward-backward averaging (a ULA, for a coherent pair such as multipath)
+ *    o N                   spatial smoothing over N overlapping subarrays (2 or 3; 0 off), a whole ULA only
  *    l 0|1                 the bearing log (/mnt/df_log, a CSV file a day) off or on
  *    h DEG                 the heading set by hand on page I (the log's compass bearings when gpsd has none)
  *    c                     calibrate now
@@ -84,7 +85,7 @@ typedef struct {
     uint8_t  state;             /* DF_ST_* */
     uint8_t  nch;               /* channels streaming (5 for a Kraken) */
     uint8_t  synth;             /* 1: a synthetic test source, no sticks */
-    uint8_t  method;            /* 0-4 (m METHOD) */
+    uint8_t  method;            /* 0-5 (m METHOD) */
     uint8_t  arr_kind;          /* 0 UCA, 1 ULA, 2 custom */
     uint8_t  arr_n;             /* elements */
     uint8_t  user_off;          /* the x MASK */
@@ -106,6 +107,7 @@ typedef struct {
     uint8_t  cpu_pct;           /* the daemon's share of one core */
     uint8_t  nsrc_set;          /* k: the sources asked for, 0 AUTO */
     uint8_t  fb;                /* w: forward-backward averaging on */
+    uint8_t  smooth;            /* o: spatial smoothing's subarrays, 0 off */
     uint8_t  iq_clients;        /* bit 0: a program on the IQ server (port 5000); bit 1: the Kraken where its
                                  * control's FREQ put it (till the GUI tunes again): the GUI takes fc and f_off */
     char     why[64];           /* the last failure, "" none */

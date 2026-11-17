@@ -14,10 +14,11 @@ Receive only: nothing here transmits.
 - Calibrates on the Kraken's own noise source: each channel's delay (whole samples, then the rest), phase and gain,
   and each tuner's filter ripple per frequency. About 0.15 s, at the start, after a retune or a gain change, on a
   slip, and every two minutes by default.
-- Takes a bearing on every 0.1 s block with MUSIC, Bartlett, Capon, MEM or TNA, for a circular (UCA-3/4/5) or
-  straight (ULA-3/4/5) array, through a channel filter on the target, above a squelch; one source, two or three
-  (their bearings together), or as many as the eigenvalues show (AUTO); forward-backward averaging on a ULA for a
-  coherent pair such as multipath.
+- Takes a bearing on every 0.1 s block with MUSIC, Bartlett, Capon, MEM, TNA or ROOT-MUSIC (a straight array's
+  bearings from a polynomial's roots, off any grid), for a circular (UCA-3/4/5), straight (ULA-3/4/5) or any other
+  layout of up to five antennas, through a channel filter on the target, above a squelch; one source, two or three
+  (their bearings together), or as many as the eigenvalues show (AUTO); forward-backward averaging and spatial
+  smoothing on a ULA for coherent sources such as multipath.
 - With gpsd running: a compass's heading, or the course over the ground while moving, turns bearings into compass
   bearings (`df_gps.c`), and the position goes with them.
 - On the radio: the sticks' readers on a core of their own at a modest real-time priority, the engine on another, and
@@ -26,11 +27,12 @@ Receive only: nothing here transmits.
   the signal stops; leaves out a channel 20 dB under the rest (a dead antenna or cable); catches a sample slip and
   calibrates again.
 - Talks to one client, the GUI's page I, on the abstract socket `@x6x00-df` (`SOCK_SEQPACKET`): binary messages out
-  (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum), short text commands in.
+  (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum, DFGP gpsd), short text commands in.
+- Keeps a bearing log (a CSV file a day) and serves the target's IQ in Heimdall's format (ports 5000 and 5001) to a
+  program on the network.
 
-Coming, in ROADMAP.md's order: several targets at once, ROOT-MUSIC, custom array shapes, an IQ server in Heimdall's
-format, sample-rate slewing, a bearing log, and a web page in GoldCorpHF's configurator. Not planned: output to the
-KrakenSDR apps, mapping services or TAK.
+Coming, in ROADMAP.md's order: several targets at once and sample-rate slewing. Not planned: output to the KrakenSDR
+apps, mapping services or TAK.
 
 ## Files
 
@@ -41,7 +43,7 @@ KrakenSDR apps, mapping services or TAK.
 | `df_engine.c` | one block in, one estimate out: channel filter, covariance, the bearing, levels, slips |
 | `df_cal.c` | FFT and calibration on the noise source |
 | `df_chan.c` | the channel filter |
-| `df_doa.c` | arrays, steering vectors, the five methods, counting sources, forward-backward averaging |
+| `df_doa.c` | arrays, steering vectors, the six methods (ROOT-MUSIC's roots by Aberth's iteration), counting sources, forward-backward averaging, spatial smoothing |
 | `df_proto.h` | the protocol between the daemon and page I |
 | `df_gps.c` | gpsd's reports read: the fix, the course, a compass, and which heading the bearings take |
 | `df_sources` | the daemon's sources, one a line (what GoldCorpHF's builds compile) |

@@ -1026,6 +1026,7 @@ static void iq_start(void) {
 static df_engine_t eng;
 static int         nsrc_set = 1;       /* k: kept across the engine's rebuilds (a new rate), as the method is */
 static bool        fb_on;
+static int         smooth_set;         /* o: spatial smoothing's subarrays (0 off) */
 static int         blk_n;
 static uint8_t    *blk[DF_MAXCH];
 static int64_t     J;                           /* CH0's next block */
@@ -1081,6 +1082,7 @@ static void engine_setup(void) {
     eng.method = (df_method_t)method;
     eng.nsrc = nsrc_set;
     eng.fb = fb_on;
+    eng.smooth = smooth_set;
     eng.sql_db = sql / 10.0;
     eng.cal_every_s = cal_every > 0 ? cal_every : -1;
     eng.user_off = user_off;
@@ -1265,6 +1267,7 @@ static void send_state(void) {
     s.cpu_pct = (uint8_t)cpu_pct;
     s.nsrc_set = (uint8_t)(eng.nsrc < 0 ? 0 : eng.nsrc ? eng.nsrc : 1);
     s.fb = eng.fb;
+    s.smooth = (uint8_t)(eng.smooth > 1 ? eng.smooth : 0);
     s.iq_clients = (uint8_t)((atomic_load(&iq_clients) ? 1 : 0) | (atomic_load(&iq_tuned) ? 2 : 0));
     snprintf(s.why, sizeof(s.why), "%s", why[0] ? why : note);
     for (int m = 0; m < nch && m < DF_PROTO_MAXCH; m++) {
@@ -1301,7 +1304,7 @@ static char   log_day[16];
 static double log_last;
 
 static void log_bearing(const df_est_t *e) {
-    static const char *const mnames[] = {"MUSIC", "BARTLETT", "CAPON", "MEM", "TNA"};
+    static const char *const mnames[] = {"MUSIC", "BARTLETT", "CAPON", "MEM", "TNA", "ROOT-MUSIC"};
     double                   t = now_s(), hd = 0, lat = 0, lon = 0;
     struct timespec          ts;
     struct tm                tm;
@@ -1532,6 +1535,9 @@ static int apply(const char *c) {
             break;
         case 'w':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.fb = fb_on = a != 0;
+            break;
+        case 'o':
+            if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0 && a <= 3) eng.smooth = smooth_set = a >= 2 ? (int)a : 0;
             break;
         case 'x':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.user_off = user_off = (unsigned)a & 0xff;

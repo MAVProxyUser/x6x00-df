@@ -34,6 +34,7 @@ static void remake(df_engine_t *e) {
     df_steer_make(&e->steer, &e->arr, DF_C / (e->fc + e->f));
     e->sub_mask = 0;                    /* made again at the next block */
     e->sub.n = 0;
+    e->ss.n = 0;
 }
 
 int df_engine_init(df_engine_t *e, int cap) {
@@ -148,6 +149,19 @@ static void sub_make(df_engine_t *e, unsigned use) {
     if (e->sub.n) df_steer_make(&e->sub_steer, &e->sub, DF_C / (e->fc + e->f));
 }
 
+/* the subarray spatial smoothing leaves (the line's first n - p + 1 elements), made again when p or the band change */
+static bool ss_make(df_engine_t *e) {
+    int L = e->arr.n - e->smooth + 1;
+
+    if (e->smooth < 2 || L < 2) return false;
+    if (e->ss.n && e->ss_p == e->smooth) return true;
+    e->ss_p = e->smooth;
+    e->ss = e->arr;
+    e->ss.n = L;
+    df_steer_make(&e->ss_steer, &e->ss, DF_C / (e->fc + e->f));
+    return true;
+}
+
 int df_engine_block(df_engine_t *e, const uint8_t *const iq[], int n, df_est_t *o) {
     int      nch = e->nch;
     unsigned all = (1u << nch) - 1, avail = all & ~e->user_off, use;
@@ -223,8 +237,21 @@ int df_engine_block(df_engine_t *e, const uint8_t *const iq[], int n, df_est_t *
         arr = &e->sub;
         st = &e->sub_steer;
     }
-    if (e->fb && arr->kind == DF_ULA && nu == nch) df_fb(R, nu);   /* a whole ULA only: one with a gap is not uniform */
-    bool doa_ok = nu >= need && k > nu && df_doa(R, arr, st, e->method, e->nsrc, k, e->front_only, &o->doa) == 0;
+    /* the method's R: smoothed (the line's subarrays) and forward-backward averaged when asked, a whole ULA only (one
+     * with a gap is not uniform); R itself stays as it is for the slip check */
+    double complex     Rd[DF_MAXCH * DF_MAXCH];
+    const df_array_t  *darr = arr;
+    const df_steer_t  *dst = st;
+    int                nr = nu;
+
+    memcpy(Rd, R, sizeof(R[0]) * (size_t)(nu * nu));
+    if (e->smooth > 1 && nu == nch && df_uniform_line(arr) && ss_make(e)) {
+        nr = df_smooth(R, nu, e->smooth, Rd);
+        darr = &e->ss;
+        dst = &e->ss_steer;
+    }
+    if (e->fb && nu == nch && df_uniform_line(darr)) df_fb(Rd, nr);
+    bool doa_ok = nu >= need && k > nu && df_doa(Rd, darr, dst, e->method, e->nsrc, k, e->front_only, &o->doa) == 0;
 
     o->have_doa = doa_ok;
 
