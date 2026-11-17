@@ -819,6 +819,40 @@ static void test_smoothing(void) {
     free_ch(ch, 5);
 }
 
+/* Several targets: two transmitters at different frequencies and bearings in the passband, an engine on each (as
+ * the daemon runs one per target, sharing the calibration): each takes its own bearing, not the other's */
+static void test_two_targets(void) {
+    df_array_t arr;
+    hw_t       hw[5];
+    df_cal_t   cal;
+    src_t      s[2] = {nfm(37, 20), nfm(200, 20)};
+
+    s[1].f = FOFF + 80000;
+    df_array_uca(&arr, 5, 0.5 * DF_C / (FC + FOFF) / (2 * sin(M_PI / 5)));
+    hw_random(hw, 5);
+    calibrate(hw, 5, &cal);
+    uint8_t **ch = gen(hw, &arr, s, 2, START * 2 + 6 * BLOCK, 0);
+
+    for (int k = 0; k < 2; k++) {
+        df_engine_t e;
+        df_est_t    est;
+
+        memset(&e, 0, sizeof(e));
+        e.nch = 5, e.fs = FS, e.fc = FC, e.f = s[k].f, e.bw = BW, e.arr = arr, e.method = DF_MUSIC;
+        e.cal_every_s = -1;
+        if (df_engine_init(&e, BLOCK)) {
+            check(0, "two targets: engine init");
+            continue;
+        }
+        df_engine_set_cal(&e, &cal);
+        run(&e, ch, &cal, 0, 5, &est);
+        check(est.gate && angdiff(est.doa.bearing, s[k].bearing) < 1.5 && !est.cal_wanted,
+              "two targets: the one at +%.0f kHz %.2f (%.0f)", (s[k].f - FOFF) / 1000, est.doa.bearing, s[k].bearing);
+        df_engine_free(&e);
+    }
+    free_ch(ch, 5);
+}
+
 int main(int argc, char **argv) {
     verbose = argc > 1 && !strcmp(argv[1], "-v");
     test_calc();
@@ -837,6 +871,7 @@ int main(int argc, char **argv) {
     test_roots();
     test_root_music();
     test_smoothing();
+    test_two_targets();
     printf("df_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

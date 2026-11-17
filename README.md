@@ -27,11 +27,15 @@ Receive only: nothing here transmits.
   the signal stops; leaves out a channel 20 dB under the rest (a dead antenna or cable); catches a sample slip and
   calibrates again.
 - Talks to one client, the GUI's page I, on the abstract socket `@x6x00-df` (`SOCK_SEQPACKET`): binary messages out
-  (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum, DFGP gpsd), short text commands in.
+  (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum, DFGP gpsd, DFTG the other targets), short text
+  commands in.
 - Keeps a bearing log (a CSV file a day) and serves the target's IQ in Heimdall's format (ports 5000 and 5001) to a
   program on the network.
 
-Coming, in ROADMAP.md's order: several targets at once and sample-rate slewing. Not planned: output to the KrakenSDR
+- Up to three more targets at once in the passband, each with its own filter, squelch and bearing, on the cores the
+  engine leaves (DFTG).
+
+Coming, in ROADMAP.md's order: sample-rate slewing. Not planned: output to the KrakenSDR
 apps, mapping services or TAK.
 
 ## Files

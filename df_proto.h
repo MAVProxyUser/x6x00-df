@@ -10,6 +10,7 @@
  *    DFDO  one estimate: bearing, its quality, every channel live    every block (10 a second)
  *    DFSP  CH0's spectrum across the whole passband                  every block
  *    DFGP  gpsd: the fix and the heading the bearings may take       once a second (all 0 / -1 without gpsd)
+ *    DFTG  the other targets' bearings (1|2|3)                       every block while one is set
  *
  *  GUI to daemon: one text command per packet, ASCII, no newline needed:
  *    f HZ                  the tuners' centre
@@ -25,6 +26,8 @@
  *    k N                   the sources to look for: 1 (default), 2, 3, 0 AUTO (counted from the eigenvalues)
  *    w 0|1                 forward-backward averaging (a ULA, for a coherent pair such as multipath)
  *    o N                   spatial smoothing over N overlapping subarrays (2 or 3; 0 off), a whole ULA only
+ *    1|2|3 OFFSET_HZ BW_HZ another target besides the main one (t): offset from the centre and bandwidth, BW 0 off;
+ *                          each its own channel filter, squelch and bearing, on a thread of its own (DFTG)
  *    l 0|1                 the bearing log (/mnt/df_log, a CSV file a day) off or on
  *    h DEG                 the heading set by hand on page I (the log's compass bearings when gpsd has none)
  *    c                     calibrate now
@@ -39,6 +42,7 @@
 #define DF_PROTO_VER     1
 #define DF_PROTO_MAXCH   8
 #define DF_PROTO_SPEC    512            /* DFSP bins */
+#define DF_PROTO_TARGETS 3              /* other targets besides the main one (DFTG) */
 
 /* what the daemon is doing (DFST.state) */
 enum {
@@ -104,7 +108,7 @@ typedef struct {
     uint16_t arr_size_mm;       /* UCA radius / ULA spacing (0 custom) */
     int16_t  arr_x_mm[DF_PROTO_MAXCH];
     int16_t  arr_y_mm[DF_PROTO_MAXCH];
-    uint8_t  cpu_pct;           /* the daemon's share of one core */
+    uint16_t cpu_pct;           /* the daemon's share of one core (over 100 with other targets: up to 400) */
     uint8_t  nsrc_set;          /* k: the sources asked for, 0 AUTO */
     uint8_t  fb;                /* w: forward-backward averaging on */
     uint8_t  smooth;            /* o: spatial smoothing's subarrays, 0 off */
@@ -159,5 +163,27 @@ typedef struct {
     uint16_t speed_cms;         /* cm/s, 0xffff unknown */
     int32_t  lat_e7, lon_e7;    /* degrees x 1e7 (0 with no fix) */
 } df_gp_msg_t;
+
+/* the other targets (commands 1-3), the newest estimate of each */
+typedef struct {
+    uint8_t  on;                /* 1: set (its thread running) */
+    uint8_t  gate;              /* 1: its bearing counts now */
+    uint8_t  fit_pct;
+    uint8_t  done_pct;          /* the blocks it kept up with over the last second (under 100: its core is short) */
+    int32_t  off_hz;            /* as set: offset from the centre */
+    uint32_t bw_hz;
+    int16_t  bearing_ddeg;      /* as DFDO's: the held one while it holds, -1 none ever */
+    int16_t  mirror_ddeg;
+    int16_t  uncert_ddeg;
+    int16_t  level_ddb;         /* the target over the floor */
+    uint16_t age_ds;            /* since its bearing was last good, 0xffff never */
+    uint16_t pad;
+} df_tg_t;
+
+typedef struct {
+    char     tag[4];            /* "DFTG" */
+    uint32_t seq;               /* the DFDO it came with */
+    df_tg_t  tg[DF_PROTO_TARGETS];
+} df_tg_msg_t;
 
 #pragma pack(pop)

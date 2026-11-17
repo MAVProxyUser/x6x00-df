@@ -55,7 +55,9 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 #include <poll.h>
@@ -623,7 +625,7 @@ static void dev_gain(void) { synth ? atomic_store(&syn_retuned, 1) : hw_gain(); 
 
 static int             ls = -1, cl = -1;
 static pthread_mutex_t cmd_lock = PTHREAD_MUTEX_INITIALIZER;
-static char            cmds[16][160];
+static char            cmds[32][160];
 static int             ncmds;
 static double          cmd_t;                   /* the last command's time (cmd_lock) */
 static bool            had_client;              /* (cmd_lock) */
@@ -683,7 +685,7 @@ static void *sock_thread(void *arg) {
                 break;
             }
             pthread_mutex_lock(&cmd_lock);
-            if (ncmds < 16) snprintf(cmds[ncmds++], sizeof(cmds[0]), "%s", b);
+            if (ncmds < 32) snprintf(cmds[ncmds++], sizeof(cmds[0]), "%s", b);
             cmd_t = now_s();
             pthread_mutex_unlock(&cmd_lock);
         }
@@ -746,7 +748,7 @@ static bool            iq_worker_on;                /* (iq_lock) */
 /* a command as the GUI's are taken (the engine applies it between blocks) */
 static void queue_cmd(const char *c) {
     pthread_mutex_lock(&cmd_lock);
-    if (ncmds < 16) snprintf(cmds[ncmds++], sizeof(cmds[0]), "%s", c);
+    if (ncmds < 32) snprintf(cmds[ncmds++], sizeof(cmds[0]), "%s", c);
     pthread_mutex_unlock(&cmd_lock);
 }
 static bool read_at(int64_t j, int n, uint8_t *const dst[]);
@@ -1024,6 +1026,8 @@ static void iq_start(void) {
 /* ------------------------------------------------------------------------------------------------- the worker */
 
 static df_engine_t eng;
+static atomic_uint set_gen;            /* the engine's settings changed (apply, engine_setup): other targets */
+static atomic_llong J_pub = -1;        /* where the block the main engine last read starts (CH0's count) */
 static int         nsrc_set = 1;       /* k: kept across the engine's rebuilds (a new rate), as the method is */
 static bool        fb_on;
 static int         smooth_set;         /* o: spatial smoothing's subarrays (0 off) */
@@ -1090,10 +1094,248 @@ static void engine_setup(void) {
     eng_on = df_engine_init(&eng, blk_n) == 0;
     if (!eng_on) logf_("engine: could not start (%d channels, array of %d)", eng.nch, arr.n);
     if (have_cal) df_engine_set_cal(&eng, &cal);
+    atomic_fetch_add(&set_gen, 1);
+    atomic_store(&J_pub, -1);
     for (int m = 0; m < DF_MAXCH; m++) {
         free(blk[m]);
         blk[m] = m < nch ? malloc(2 * (size_t)blk_n) : NULL;
     }
+}
+
+static int16_t ddeg(double d) { return d < 0 ? -1 : (int16_t)lrint(fmod(d, 360) * 10) % 3600; }
+static int16_t clamp16(double v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v)); }
+
+/* ------------------------------------------------------------------------------------ other targets (ROADMAP 8)
+ * Up to DF_PROTO_TARGETS more targets in the Kraken's passband besides the main one (commands 1-3): each its own
+ * engine (channel filter, squelch, bearing) on a thread of its own, reading the same rings the block the main engine
+ * last read, with the main one's settings and calibration. The main target never waits for them: one that cannot
+ * keep up takes the newest block and says how many it kept up with (done_pct). Their threads go on CPU2 (with the
+ * readers, which come first), CPU0 (the GUI's) and CPU1 (the USB interrupt's), at nice 10 so the GUI and the rest
+ * come first: the engine's own core has no room for another */
+
+typedef struct {
+    int32_t     off;                    /* set: the offset from the centre (tg_lock) */
+    uint32_t    bw;                     /* 0: off (tg_lock) */
+    bool        alive;                  /* its thread runs (tg_lock) */
+    bool        joinable;
+    pthread_t   th;
+    df_tg_t     out;                    /* the newest, for DFTG (tg_lock) */
+    double      last_good_at, last_bearing, last_mirror, last_uncert;
+    double      held_bearing, held_mirror, held_uncert, held_fit;
+} target_t;
+
+static target_t        tg[DF_PROTO_TARGETS];
+static df_engine_t     tg_eng[DF_PROTO_TARGETS];
+static pthread_mutex_t tg_lock = PTHREAD_MUTEX_INITIALIZER;
+static const int       tg_cpu[DF_PROTO_TARGETS] = {2, 0, 1};    /* measured with five sticks streaming: CPU2 81 % with
+                                                                 * one target and the readers, CPU1 full of the USB
+                                                                 * interrupt's copying (a target there kept up with
+                                                                 * 74 % of blocks), CPU0 the GUI's at about 25 % */
+#define TG_NICE 10                                              /* below the GUI and everything else */
+
+/* the newest estimate kept as DFDO keeps the main one's: a held bearing for HOLD_S once the gate shuts */
+static void tg_take(target_t *t, const df_est_t *e, int done_pct) {
+    double  now = now_s();
+    df_tg_t o;
+
+    memset(&o, 0, sizeof(o));
+    o.on = 1;
+    o.gate = e->gate;
+    o.done_pct = (uint8_t)(done_pct > 100 ? 100 : done_pct);
+    o.fit_pct = (uint8_t)lrint(fmin(1, fmax(0, e->doa.fit)) * 100);
+    if (e->gate) {
+        if (t->last_good_at < 0 || now - t->last_good_at >= HOLD_S) t->held_bearing = -1;
+        t->last_good_at = now;
+        t->last_bearing = e->doa.bearing;
+        t->last_mirror = e->doa.mirror;
+        t->last_uncert = e->uncert_deg;
+        if (e->doa.fit >= HOLD_FIT) {
+            t->held_bearing = e->doa.bearing;
+            t->held_mirror = e->doa.mirror;
+            t->held_uncert = e->uncert_deg;
+            t->held_fit = e->doa.fit;
+        }
+    }
+    if (!e->gate && t->held_bearing >= 0 && now - t->last_good_at < HOLD_S) {
+        o.bearing_ddeg = ddeg(t->held_bearing);
+        o.mirror_ddeg = ddeg(t->held_mirror);
+        o.uncert_ddeg = clamp16(t->held_uncert * 10);
+        o.fit_pct = (uint8_t)lrint(fmin(1, fmax(0, t->held_fit)) * 100);
+    } else {
+        o.bearing_ddeg = ddeg(t->last_bearing);
+        o.mirror_ddeg = ddeg(t->last_mirror);
+        o.uncert_ddeg = clamp16(t->last_uncert * 10);
+    }
+    o.level_ddb = clamp16(e->level_db * 10);
+    o.age_ds = t->last_good_at < 0 ? 0xffff : (uint16_t)fmin(65534, (now - t->last_good_at) * 10);
+    pthread_mutex_lock(&tg_lock);
+    o.off_hz = t->off;
+    o.bw_hz = t->bw;
+    t->out = o;
+    pthread_mutex_unlock(&tg_lock);
+}
+
+static void *tg_worker(void *arg) {
+    int          i = (int)(intptr_t)arg;
+    target_t    *t = &tg[i];
+    df_engine_t *e = &tg_eng[i];
+    bool         e_on = false;
+    uint8_t     *raw[DF_MAXCH] = {0};
+    int          n = 0, done = 0;
+    int64_t      j = -1;
+    unsigned     sgen = ~0u, cgen = ~0u;
+    int32_t      e_off = 0;
+    uint32_t     e_bw = 0, e_fc = 0, e_rate = 0;
+    double       win_t = now_s();
+    int          done_pct = 100;
+
+    pin_self(tg_cpu[i], 0, "a target");
+    if (setpriority(PRIO_PROCESS, (id_t)syscall(SYS_gettid), TG_NICE)) logf_("target %d: nice not set", i + 2);
+    t->last_good_at = -1, t->held_bearing = -1, t->last_bearing = t->last_mirror = -1;
+    for (;;) {
+        pthread_mutex_lock(&tg_lock);
+        int32_t  off = t->off;
+        uint32_t bw = t->bw;
+
+        if (!bw || atomic_load(&quit_now)) {            /* cleared: the thread ends (said under the lock, so a new
+                                                         * setting finds it gone and starts another) */
+            t->alive = false;
+            memset(&t->out, 0, sizeof(t->out));
+            pthread_mutex_unlock(&tg_lock);
+            break;
+        }
+        pthread_mutex_unlock(&tg_lock);
+        if (!eng_on || !atomic_load(&streaming) || !nch || !rate) {
+            usleep(100000);
+            continue;
+        }
+        /* the settings, the band or this target changed: its engine anew, from the main one's settings */
+        if (!e_on || sgen != atomic_load(&set_gen) || off != e_off || bw != e_bw || fc != e_fc || rate != e_rate) {
+            if (e_on) df_engine_free(e);
+            sgen = atomic_load(&set_gen);
+            memset(e, 0, sizeof(*e));
+            e->nch = arr.n <= nch ? arr.n : nch;
+            e->fs = rate;
+            e->fc = fc;
+            e->f = off;
+            e->bw = bw;
+            e->arr = arr;
+            if (e->arr.n > e->nch) e->arr.n = e->nch;
+            e->method = (df_method_t)method;
+            e->nsrc = nsrc_set;
+            e->fb = fb_on;
+            e->smooth = smooth_set;
+            e->sql_db = sql / 10.0;
+            e->cal_every_s = -1;                        /* the main engine calibrates */
+            e->user_off = user_off;
+            n = (int)(rate / 10);
+            e_on = df_engine_init(e, n) == 0;
+            for (int m = 0; m < DF_MAXCH; m++) {
+                free(raw[m]);
+                raw[m] = m < nch ? malloc(2 * (size_t)n) : NULL;
+            }
+            e_off = off, e_bw = bw, e_fc = fc, e_rate = rate;
+            cgen = ~0u, j = -1;
+            t->last_good_at = -1, t->held_bearing = -1, t->last_bearing = t->last_mirror = -1;
+            if (!e_on) {
+                usleep(200000);
+                continue;
+            }
+        }
+        if (cgen != atomic_load(&cal_gen)) {
+            pthread_mutex_lock(&cal_lock);
+            cgen = atomic_load(&cal_gen);
+            if (have_cal) df_engine_set_cal(e, &cal);
+            pthread_mutex_unlock(&cal_lock);
+            j = -1;
+        }
+        /* the blocks the main engine has read, in order (it reads in bursts after a wait); more than four behind,
+         * skip to its newest */
+        int64_t newest = atomic_load(&J_pub);
+
+        if (newest < 0 || (j >= 0 && j > newest)) {
+            usleep(10000);
+            continue;
+        }
+        if (j < 0 || newest - j > 4 * (int64_t)n) j = newest;
+        pthread_mutex_lock(&cal_lock);
+        bool got = cgen == atomic_load(&cal_gen) && read_at(j, n, raw);
+        pthread_mutex_unlock(&cal_lock);
+        if (!got) {
+            j = -1;
+            usleep(10000);
+            continue;
+        }
+        j += n;
+        df_est_t est;
+
+        df_engine_block(e, (const uint8_t *const *)raw, n, &est);
+        done++;
+        double now = now_s();
+
+        if (now - win_t >= 1) {
+            done_pct = (int)lrint(100.0 * done / ((now - win_t) * rate / n));
+            done = 0;
+            win_t = now;
+        }
+        tg_take(t, &est, done_pct);
+    }
+    if (e_on) df_engine_free(e);
+    for (int m = 0; m < DF_MAXCH; m++) free(raw[m]);
+    return NULL;
+}
+
+/* "1|2|3 OFFSET_HZ BW_HZ": a target set, moved or cleared; its thread started when it is not running */
+static void tg_set(int i, int32_t off, uint32_t bw) {
+    target_t *t = &tg[i];
+
+    pthread_mutex_lock(&tg_lock);
+    t->off = off;
+    t->bw = bw;
+    bool need = bw && !t->alive;
+
+    if (need) t->alive = true;
+    pthread_mutex_unlock(&tg_lock);
+    if (!need) return;
+    if (t->joinable) pthread_join(t->th, NULL), t->joinable = false;     /* the one before, ended */
+    t->joinable = pthread_create(&t->th, NULL, tg_worker, (void *)(intptr_t)i) == 0;
+    if (!t->joinable) {
+        pthread_mutex_lock(&tg_lock);
+        t->alive = false;
+        pthread_mutex_unlock(&tg_lock);
+        logf_("target %d: no thread", i + 1);
+    }
+}
+
+static void tg_end_all(void) {
+    for (int i = 0; i < DF_PROTO_TARGETS; i++) {
+        pthread_mutex_lock(&tg_lock);
+        tg[i].bw = 0;
+        pthread_mutex_unlock(&tg_lock);
+        if (tg[i].joinable) pthread_join(tg[i].th, NULL), tg[i].joinable = false;
+    }
+}
+
+static void send_targets(uint32_t seq) {
+    df_tg_msg_t m;
+    bool        any = false;
+
+    memset(&m, 0, sizeof(m));
+    memcpy(m.tag, "DFTG", 4);
+    m.seq = seq;
+    pthread_mutex_lock(&tg_lock);
+    for (int i = 0; i < DF_PROTO_TARGETS; i++) {
+        if (tg[i].bw) {
+            m.tg[i] = tg[i].out;
+            m.tg[i].on = 1;
+            m.tg[i].off_hz = tg[i].off;
+            m.tg[i].bw_hz = tg[i].bw;
+            if (!tg[i].out.on) m.tg[i].bearing_ddeg = m.tg[i].mirror_ddeg = -1, m.tg[i].age_ds = 0xffff;
+            any = true;
+        }
+    }
+    pthread_mutex_unlock(&tg_lock);
+    if (any) send_msg(&m, sizeof(m));
 }
 
 static void send_state(void);
@@ -1219,8 +1461,6 @@ failed:
 
 /* ------------------------------------------------------------------------------------------------- messages */
 
-static int16_t ddeg(double d) { return d < 0 ? -1 : (int16_t)lrint(fmod(d, 360) * 10) % 3600; }
-static int16_t clamp16(double v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v)); }
 
 static int ch_cond(int m) {
     if (m >= nch || atomic_load(&ch[m].ended)) return DF_CH_GONE;
@@ -1264,7 +1504,7 @@ static void send_state(void) {
         s.arr_x_mm[m] = clamp16(arr.x[m] * 1000);
         s.arr_y_mm[m] = clamp16(arr.y[m] * 1000);
     }
-    s.cpu_pct = (uint8_t)cpu_pct;
+    s.cpu_pct = (uint16_t)(cpu_pct < 0 ? 0 : cpu_pct > 65535 ? 65535 : cpu_pct);
     s.nsrc_set = (uint8_t)(eng.nsrc < 0 ? 0 : eng.nsrc ? eng.nsrc : 1);
     s.fb = eng.fb;
     s.smooth = (uint8_t)(eng.smooth > 1 ? eng.smooth : 0);
@@ -1539,12 +1779,19 @@ static int apply(const char *c) {
         case 'o':
             if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0 && a <= 3) eng.smooth = smooth_set = a >= 2 ? (int)a : 0;
             break;
+        case '1':
+        case '2':
+        case '3':                                       /* another target: offset, bandwidth (0 off) */
+            if (sscanf(c + 1, "%lf %lf", &a, &b) == 2 && fabs(a) <= 1.5e6 && b >= 0 && b <= 250000)
+                tg_set(c[0] - '1', (int32_t)lrint(a), (uint32_t)lrint(b));
+            break;
         case 'x':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.user_off = user_off = (unsigned)a & 0xff;
             break;
         case 'c': return 1;
         case 'Q': return 3;
     }
+    if (c[0] && strchr("amqkwox", c[0])) atomic_fetch_add(&set_gen, 1);   /* the other targets' engines anew */
     return 0;
 }
 
@@ -1704,6 +1951,7 @@ static void run(bool print) {
                 continue;
             }
             J += blk_n;
+            atomic_store(&J_pub, J - blk_n);            /* the other targets read the same block */
             if (!eng_on) continue;
 
             df_est_t e;
@@ -1725,6 +1973,7 @@ static void run(bool print) {
                : DF_ST_LISTEN;
             send_estimate(&e, seq);
             send_spectrum(seq);
+            send_targets(seq);
             seq++;
             if (print) print_est(&e);
             if (e.cal_wanted) calibrate(e.cal_wanted == 1);
@@ -1747,6 +1996,7 @@ static void run(bool print) {
                 cpu_t = t;
             }
         }
+        atomic_store(&J_pub, -1);
         dev_close();
         if (reopen && !atomic_load(&quit_now)) {
             logf_("open again: %s", why[0] ? why : "a new rate");
@@ -1755,6 +2005,7 @@ static void run(bool print) {
             sleep(1);
         }
     }
+    tg_end_all();
     dev_close();
     st = DF_ST_NODEV;
     send_state();
