@@ -24,6 +24,8 @@
  *    x MASK                channels the user leaves out of the bearing (bit m: channel m)
  *    k N                   the sources to look for: 1 (default), 2, 3, 0 AUTO (counted from the eigenvalues)
  *    w 0|1                 forward-backward averaging (a ULA, for a coherent pair such as multipath)
+ *    l 0|1                 the bearing log (/mnt/df_log, a CSV file a day) off or on
+ *    h DEG                 the heading set by hand on page I (the log's compass bearings when gpsd has none)
  *    c                     calibrate now
  *    Q                     end (the sticks closed, the noise source off)
  */

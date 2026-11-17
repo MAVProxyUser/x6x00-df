@@ -55,6 +55,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 #include <poll.h>
@@ -1284,12 +1285,74 @@ static void send_state(void) {
     send_msg(&s, sizeof(s));
 }
 
+/* ------------------------------------------------------------------------------------------------ the bearing log */
+
+/* Each bearing over the squelch, two a second at most, in a CSV file a day (UTC) on the DATA partition (ROADMAP.md,
+ * 5): when, where (gpsd's fix), the frequency, the bearing from ANT 0, the heading and where it came from, the compass
+ * bearing, its +- and fit, the level, the method and the other sources. Off unless asked (l 1); h DEG is the heading
+ * set by hand on page I, which the log uses when gpsd has none. Local only: nothing leaves the radio */
+#define LOG_DIR     "/mnt/df_log"
+#define LOG_EVERY_S 0.5
+
+static bool   log_on;
+static int    hand_heading;
+static FILE  *log_f;
+static char   log_day[16];
+static double log_last;
+
+static void log_bearing(const df_est_t *e) {
+    static const char *const mnames[] = {"MUSIC", "BARTLETT", "CAPON", "MEM", "TNA"};
+    double                   t = now_s(), hd = 0, lat = 0, lon = 0;
+    struct timespec          ts;
+    struct tm                tm;
+    char                     day[16], when[32];
+
+    if (!log_on || !e->gate || t - log_last < LOG_EVERY_S) return;
+    log_last = t;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    gmtime_r(&ts.tv_sec, &tm);
+    strftime(day, sizeof(day), "%Y-%m-%d", &tm);
+    strftime(when, sizeof(when), "%Y-%m-%dT%H:%M:%S", &tm);
+    if (!log_f || strcmp(day, log_day)) {
+        char path[64];
+        bool fresh;
+
+        if (log_f) fclose(log_f);
+        mkdir(LOG_DIR, 0755);
+        snprintf(path, sizeof(path), LOG_DIR "/%s.csv", day);
+        fresh = access(path, F_OK) != 0;
+        if (!(log_f = fopen(path, "a"))) return;
+        snprintf(log_day, sizeof(log_day), "%s", day);
+        if (fresh)
+            fprintf(log_f, "utc,freq_hz,bearing_ant0,heading,heading_from,bearing,plus_minus,fit_pct,level_db,snr_db,"
+                           "method,sources,other_bearings,lat,lon\n");
+    }
+    pthread_mutex_lock(&gps_lock);
+    int  src = df_gps_heading(&gps, t, &hd);
+    bool fix = df_gps_fix(&gps, t, &lat, &lon);
+    pthread_mutex_unlock(&gps_lock);
+    const char *from = src == DF_HEAD_COMPASS ? "compass" : src == DF_HEAD_COURSE ? "gps course" : hand_heading ? "set" : "";
+    if (!src) hd = hand_heading;
+    char other[48] = "";
+    for (int i = 0; i < e->doa.npeaks && i < 3; i++)
+        snprintf(other + strlen(other), sizeof(other) - strlen(other), "%s%.1f", i ? " " : "", e->doa.peaks[i]);
+    fprintf(log_f, "%s.%03ldZ,%lld,%.1f,", when, ts.tv_nsec / 1000000, (long long)fc + f_off, e->doa.bearing);
+    if (*from) fprintf(log_f, "%.1f,%s,%.1f,", hd, from, fmod(e->doa.bearing + hd, 360.0));
+    else fprintf(log_f, ",,,");
+    fprintf(log_f, "%.1f,%.0f,%.1f,%.1f,%s,%d,%s,", e->uncert_deg, e->doa.fit * 100, e->level_db, e->doa.snr_db,
+            mnames[method >= 0 && method < 5 ? method : 0], e->doa.nsrc > 0 ? e->doa.nsrc : 1, other);
+    if (fix) fprintf(log_f, "%.7f,%.7f\n", lat, lon);
+    else fprintf(log_f, ",\n");
+    fflush(log_f);
+}
+
 static void send_estimate(const df_est_t *e, uint32_t seq) {
     df_do_msg_t d;
     double      t = now_s();
 
     memset(&d, 0, sizeof(d));
     memcpy(d.tag, "DFDO", 4);
+    log_bearing(e);
     d.seq = seq;
     d.gate = e->gate;
     d.bad_ch = (int8_t)e->bad_ch;
@@ -1457,6 +1520,15 @@ static int apply(const char *c) {
             break;
         case 'k':
             if (sscanf(c + 1, "%lf", &a) == 1 && a >= 0 && a <= 3) eng.nsrc = nsrc_set = (int)a ? (int)a : -1;
+            break;
+        case 'l':
+            if (sscanf(c + 1, "%lf", &a) == 1) {
+                log_on = a != 0;
+                if (!log_on && log_f) fclose(log_f), log_f = NULL;
+            }
+            break;
+        case 'h':
+            if (sscanf(c + 1, "%lf", &a) == 1) hand_heading = ((int)a % 360 + 360) % 360;
             break;
         case 'w':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.fb = fb_on = a != 0;
