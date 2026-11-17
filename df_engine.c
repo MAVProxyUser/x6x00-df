@@ -291,7 +291,8 @@ int df_engine_block(df_engine_t *e, const uint8_t *const iq[], int n, df_est_t *
         if (fw[b] >= 0.9 && fw[b] - o->doa.fit >= 0.1 && o->ch_db[idx[b]] >= o->level_db - DF_LOW_DB)
             suspect = true, o->bad_ch = idx[b];
     }
-    if (e->have_cal && doa_ok && o->level_db >= 15 && o->doa.fit < 0.5) suspect = true;
+    if (e->have_cal && doa_ok && o->level_db >= 15 && o->doa.nsrc == 1 && o->doa.fit < 0.5) suspect = true;   /* one
+                                     * source only: two or three never fit one plane wave (CI's multipath, 2026-11-17) */
     if (suspect) {
         o->gate = false;
         e->low_fit += dt;

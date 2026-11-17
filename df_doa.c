@@ -432,6 +432,18 @@ int df_doa(const double complex *R, const df_array_t *arr, const df_steer_t *st,
     double rb[3];
     int    nrb = m == DF_ROOTMUSIC && df_uniform_line(arr) ? root_music(V, n, nsrc, arr->size, st->lambda, nsrc, rb) : 0;
 
+    if (nrb > 1) {                      /* strongest first, by Bartlett's power at each: which root lies nearest the
+                                         * circle is no measure of it (two sources both sit on it, and which came
+                                         * first changed between x86 and ARM) */
+        double pw[3];
+
+        for (int i = 0; i < nrb; i++) df_steer_at(arr, st->lambda, rb[i], a), pw[i] = quad(R, n, a);
+        for (int i = 1; i < nrb; i++)
+            for (int j = i; j > 0 && pw[j] > pw[j - 1]; j--) {
+                double t = pw[j]; pw[j] = pw[j - 1]; pw[j - 1] = t;
+                t = rb[j]; rb[j] = rb[j - 1]; rb[j - 1] = t;
+            }
+    }
     if (nrb >= 1) o->bearing = rb[0], o->rooted = true;     /* the grid's peak gives way to the root */
     if (line) o->mirror = wrapd(180 - o->bearing);
     o->papr_db = 10 * log10(pmax / (sum / DF_GRID));

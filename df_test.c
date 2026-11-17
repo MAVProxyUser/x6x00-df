@@ -811,9 +811,11 @@ static void test_smoothing(void) {
         run(&e, ch, &cal, 0, 5, &est);
         bool both = pair_found(&est.doa, 340, 30, 3);
 
-        check(mode ? both && est.gate : !both || !est.gate, "multipath in the engine, %s: %.1f and %.1f (340, 30)%s",
-              mode ? "smoothing and FB" : "neither", est.doa.bearing, est.doa.npeaks ? est.doa.peaks[0] : -1,
-              est.gate ? "" : ", gate shut");
+        check(mode ? both && est.gate && angdiff(est.doa.bearing, 340) < 3 : !both || !est.gate,   /* the stronger first */
+              "multipath in the engine, %s: %.1f and %.1f (340, 30)%s, "
+              "the second source %.1f dB over the noise, level %.1f dB, fit %.2f", mode ? "smoothing and FB" : "neither",
+              est.doa.bearing, est.doa.npeaks ? est.doa.peaks[0] : -1, est.gate ? "" : ", gate shut", est.doa.sep_db,
+              est.level_db, est.doa.fit);
         df_engine_free(&e);
     }
     free_ch(ch, 5);
