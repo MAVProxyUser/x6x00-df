@@ -91,6 +91,10 @@ forward-backward averaging done, in the host checks; ROOT-MUSIC and spatial smoo
 
 ## 7. Custom arrays
 
+Done 2026-11-17: positions in cm (forward, left) in `/mnt/df_array.txt`, drawn, dragged and typed on the web page's
+Custom layout editor, CUSTOM on page I's ARRAY row; the daemon's `a custom N x y ...` (mm) as before. Checked on the
+radio with a 20 cm square: four channels in use, the fifth OFF (SET).
+
 - Any layout of up to five antennas as x and y positions (metres; x forward, y left), from a file on the DATA
   partition (`/mnt/df_array.txt`), drawn and edited on the web page (3), and chosen on page I as CUSTOM. The engine already steers from positions.
 
