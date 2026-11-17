@@ -1122,6 +1122,8 @@ static void run(bool print) {
             if (e.cal_wanted == 1) {
                 slips++;
                 slip_shown = true;
+                if (e.bad_ch >= 0) logf_("slip on CH%d (%d so far): calibrating again", e.bad_ch, slips);
+                else logf_("slip (%d so far): calibrating again", slips);
             }
             st = !have_cal ? DF_ST_NOCAL
                : slip_shown ? DF_ST_SLIP
