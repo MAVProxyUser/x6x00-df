@@ -1255,6 +1255,7 @@ static void *tg_worker(void *arg) {
             pthread_mutex_lock(&cal_lock);
             cgen = atomic_load(&cal_gen);
             if (have_cal) df_engine_set_cal(e, &cal);
+            else e->have_cal = false;       /* none now (a failed one after a slew): no bearings on the old one */
             pthread_mutex_unlock(&cal_lock);
             j = -1;
         }
@@ -1942,7 +1943,16 @@ static bool calibrate_aligned(bool search) {
         }
         logf_("slew %d: from%s", r + 1, b);
         usleep(50000);
-        if (!(ok = calibrate(false))) return ok;
+        if (!(ok = calibrate(false))) {    /* the sticks moved and no calibration says where: none, not the old one
+                                             * (up to half a sample off); the loop calibrates again in 10 s */
+            pthread_mutex_lock(&cal_lock);
+            have_cal = false;
+            atomic_fetch_add(&cal_gen, 1);
+            pthread_mutex_unlock(&cal_lock);
+            eng.have_cal = false;
+            logf_("slew: the calibration after it failed: none till the next");
+            return ok;
+        }
     }
     {
         char b[160];
