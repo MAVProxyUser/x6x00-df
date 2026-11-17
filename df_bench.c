@@ -3,11 +3,11 @@
  *
  *  GoldCorpHF - what x6x00-df's engine costs (docs/plans/kraken_df_plan.md, Phase 0, test 0c): five channels of
  *  bytes at each sample rate, 0.1 s blocks, CPU time per second of signal, i.e. the share of one core.
- *  On the Mac:   cc -O3 -o /tmp/df_bench tools/rtlspec/df_bench.c tools/rtlspec/df_{cal,chan,doa,engine}.c -lm
- *  For the radio (as x6x00-rtlspec is built, tools/rtlsdr/build.sh):
+ *  On the Mac:   make df_bench (or cc -O3 -o df_bench df_bench.c df_{cal,chan,doa,engine}.c -lm)
+ *  For the radio (as GoldCorpHF's tools/rtlsdr/build.sh builds x6x00-rtlspec):
  *      arm-linux-gnueabihf-gcc --sysroot=build/x6200/sysroot -isystem build/x6200/sysroot/usr/include/arm-linux-gnueabihf \
- *          -O3 -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -o df_bench tools/rtlspec/df_bench.c \
- *          tools/rtlspec/df_{cal,chan,doa,engine}.c -lm
+ *          -O3 -mcpu=cortex-a7 -mfpu=neon-vfpv4 -mfloat-abi=hard -o df_bench df_bench.c \
+ *          df_{cal,chan,doa,engine}.c -lm
  *      df_bench [seconds]
  */
 

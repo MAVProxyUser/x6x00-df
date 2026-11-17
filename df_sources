@@ -1,6 +1,7 @@
-# x6x00-df's sources (the Kraken direction finder, docs/plans/kraken_df_plan.md), one a line: tools/rtlsdr/build.sh and
-# the image's buildroot package (x6x00-rtlspec, which builds both daemons) compile these. df_test.c and df_bench.c
-# are the host checks', not the daemon's.
+# x6x00-df's sources, one a line. GoldCorpHF (github.com/MAVProxyUser/X6200-claude-assist-UI) builds the daemon from
+# these, with this repository as its submodule tools/rtlspec/x6x00-df: its tools/rtlsdr/build.sh for a hot install and
+# the image's buildroot package (x6x00-rtlspec, which builds both daemons). df_test.c and df_bench.c are the host
+# checks' (Makefile), not the daemon's.
 df.c
 df_cal.c
 df_chan.c

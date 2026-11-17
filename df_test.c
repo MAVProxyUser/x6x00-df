@@ -7,8 +7,8 @@
  *  the engine's steering), then that channel's own whole and fractional sample delay, phase and gain, its own noise,
  *  and 8-bit bytes. Calibration blocks are one noise shared by every channel through the same hardware.
  *  Off the radio:
- *      cc -O2 -Wall -Wextra -o /tmp/df_test tools/rtlspec/df_test.c tools/rtlspec/df_cal.c tools/rtlspec/df_chan.c \
- *          tools/rtlspec/df_doa.c tools/rtlspec/df_engine.c -lm && /tmp/df_test [-v]
+ *      make test (or cc -O2 -Wall -Wextra -o df_test df_test.c df_cal.c df_chan.c df_doa.c df_engine.c -lm &&
+ *          ./df_test [-v])
  */
 
 #include "df.h"

@@ -1,7 +1,7 @@
 /*
  *  SPDX-License-Identifier: LGPL-2.1-or-later
  *
- *  GoldCorpHF - what x6x00-df (the direction finder, tools/rtlspec/df.c) and the GUI's page I (src/df_rx.c,
+ *  GoldCorpHF - what x6x00-df (the direction finder, df.c) and the GUI's page I (src/df_rx.c,
  *  src/app_df.c) say to each other, on the abstract SOCK_SEQPACKET socket "@x6x00-df" (one client at a time).
  *
  *  Daemon to GUI: binary packets, each one of the structs below, its first 4 bytes the tag. Both ends are the

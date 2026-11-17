@@ -8,7 +8,7 @@
 # one opened at a time, all streaming together, then counts the loss EVENTS per channel per hour. Receive only:
 # nothing is transmitted, nothing on the radio is changed but files in /tmp/df_slip (removed at the end).
 #
-#     tools/rtlspec/df_slip_test.sh [-h root@radio] [-s rate] [-m minutes] [-l 'serials']   (defaults 1024000, 30,
+#     ./df_slip_test.sh [-h root@radio] [-s rate] [-m minutes] [-l 'serials']   (defaults 1024000, 30,
 #                                                                                          all five)
 #
 # Before: the Kraken on its own power on the HOST port; no watch channel and no AIRSPACE receiver on its sticks (the
