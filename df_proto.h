@@ -104,7 +104,8 @@ typedef struct {
     uint8_t  cpu_pct;           /* the daemon's share of one core */
     uint8_t  nsrc_set;          /* k: the sources asked for, 0 AUTO */
     uint8_t  fb;                /* w: forward-backward averaging on */
-    uint8_t  pad;
+    uint8_t  iq_clients;        /* bit 0: a program on the IQ server (port 5000); bit 1: the Kraken where its
+                                 * control's FREQ put it (till the GUI tunes again): the GUI takes fc and f_off */
     char     why[64];           /* the last failure, "" none */
     df_ch_t  ch[DF_PROTO_MAXCH];
 } df_st_msg_t;

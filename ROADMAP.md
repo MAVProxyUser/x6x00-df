@@ -103,6 +103,13 @@ forward-backward averaging done, in the host checks; ROOT-MUSIC and spatial smoo
 
 ## 9. The IQ server, in Heimdall's format
 
+First version done 2026-11-17: ports 5000 and 5001 in Heimdall's protocol, 25 kHz around the target at 64 kS/s
+(-I BW), calibrated, frames typed DATA/CAL/DUMMY with Heimdall's flags; FREQ and GAIN through the daemon's own command
+path, and a retune by an IQ program flagged in DFST (iq_clients bit 1) so page I and the web page take it. Tried from a
+computer with a client written as krakensdr_doa's receiver is: the headers right, 2.45 frames a second over the
+radio's WiFi, FREQ to 106.6 MHz retuned and recalibrated with the channels correlated 0.5-0.7 on the station. Not yet
+tried with KrakenRF's own software, nor a CAL frame seen.
+
 - TCP port 5000, as Heimdall's: 1024-byte IQ headers (`iq_header_struct`, same field order and natural alignment;
   sync word 0x2bf7b95a) then the five channels' samples, complex float 32, calibrated (whole-sample delay, phase and
   gain corrected) and with Heimdall's sync flags set from our own calibration. So KrakenRF's DoA and passive-radar

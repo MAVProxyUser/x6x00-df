@@ -19,10 +19,11 @@
  *  it is on (so nothing else may listen on a Kraken stick while this runs).
  *
  *    x6x00-df [-F] [-S name] [-p] [-f HZ] [-s RATE] [-g TENTHS] [-t OFFSET,BW] [-a uca|ula,N,MM] [-m METHOD]
- *             [-i SECONDS] [-n CHANNELS] [-D] [-C CORES] [-T BEARING[,DEG_PER_S[,DEAD_CH]]]
+ *             [-i SECONDS] [-n CHANNELS] [-D] [-C CORES] [-I BW] [-T BEARING[,DEG_PER_S[,DEAD_CH]]]
  *      -F  in the foreground (else it goes to the background; its log /tmp/x6x00-df.log)
  *      -p  print one line per estimate (with -F: a test from a shell)
  *      -D  leave the tuners' PLL dither on (with our patched librtlsdr it is switched off: test 1g compares)
+ *      -I  BW: the IQ server's band in Hz (default 25000: 64 kS/s); 0 no IQ server (ports 5000, 5001)
  *      -C  READERS,ENGINE[,PRIO]: the cores (default 2,3,10: the readers on CPU2 at SCHED_FIFO 10, the engine on CPU3,
  *          the musb interrupt moved to CPU1); -C off leaves all of it to the kernel
  *      -n  open CH0 to CH(n-1) only (2-5; CH0 always, it has the noise source): a bench with another program on the
@@ -689,6 +690,336 @@ static void *sock_thread(void *arg) {
     return NULL;
 }
 
+/* ------------------------------------------------------------------------------------ the IQ server (Heimdall's) */
+
+/* The Kraken's samples for other programs (ROADMAP.md, 9): KrakenRF's DoA and passive-radar software take them from
+ * Heimdall's IQ server, and this one speaks its protocol. TCP 5000: a client sends "streaming", reads a frame (the
+ * 1024-byte header below, then every channel's samples as complex float 32, channel after channel), and asks for each
+ * next one with "IQDownload" ("q" or anything else ends it). TCP 5001, the control: 128-byte messages "INIT", "FREQ"
+ * (a uint64 Hz), "GAIN" (a uint32 tenths of a dB per channel), "AGC ", "EXIT", each answered "FNSD".
+ *
+ * What it sends: not the raw 1.024 MS/s (five channels in float are 41 MB/s, far over the radio's WiFi) but the band
+ * around the DF target, I BW wide (default 25 kHz, so 64 kS/s and 2.6 MB/s), through a channel filter of its own,
+ * each channel lined up (the calibration's whole samples) and corrected (its phase, fraction of a sample and gain at
+ * the band's centre). The header's flags say how far to trust it: delay_sync and iq_sync once calibrated, and a frame
+ * the noise source was on for is a CAL frame, as Heimdall marks them. One client of each at a time. FREQ puts the
+ * Kraken a quarter of its rate under the frequency asked and the DF target on it, as page I's bands do; GAIN sets
+ * every channel to the first one's. The filtering runs on its own thread, only while a client is there. Receive
+ * only. */
+
+#define IQ_PORT     5000
+#define CTL_PORT    5001
+#define IQ_SYNC     0x2bf7b95au
+
+typedef struct {                /* Heimdall's iq_header_struct, the same fields in the same order: natural alignment
+                                 * (a uint64 on 8 bytes) on the radio's ARM EABI as on a computer's x86-64 */
+    uint32_t sync_word, frame_type;
+    char     hardware_id[16];
+    uint32_t unit_id, active_ant_chs, ioo_type;
+    uint64_t rf_center_freq, adc_sampling_freq, sampling_freq;
+    uint32_t cpi_length;
+    uint64_t time_stamp;
+    uint32_t daq_block_index, cpi_index;
+    uint64_t ext_integration_cntr;
+    uint32_t data_type, sample_bit_depth, adc_overdrive_flags, if_gains[32], delay_sync_flag, iq_sync_flag,
+             sync_state, noise_source_state, reserved[192], header_version;
+} iq_hdr_t;
+_Static_assert(sizeof(iq_hdr_t) == 1024, "Heimdall's IQ header is 1024 bytes");
+
+enum { IQ_DATA = 0, IQ_DUMMY = 1, IQ_CAL = 3 };
+
+static int             iq_bw_set = 25000;           /* the band served, Hz (-I BW; 0 no server) */
+static atomic_int      iq_clients;                  /* a client on 5000 */
+static atomic_bool     iq_tuned;                    /* the Kraken where an IQ program's FREQ put it (till the GUI tunes) */
+static atomic_uint     cal_gen;                     /* kb or the calibration changed (cal_lock) */
+static atomic_llong    noise_from = -1, noise_to = -1;  /* CH0's counts the last calibration's noise covered */
+static pthread_mutex_t cal_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t iq_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  iq_cond = PTHREAD_COND_INITIALIZER;
+static float complex  *iq_frame;                    /* the newest frame, nch x cpi (iq_lock) */
+static iq_hdr_t        iq_h;                        /* its header (iq_lock) */
+static uint32_t        iq_seq;                      /* frames made (iq_lock) */
+static size_t          iq_bytes;                    /* its payload's size (iq_lock) */
+static bool            iq_worker_on;                /* (iq_lock) */
+
+/* a command as the GUI's are taken (the engine applies it between blocks) */
+static void queue_cmd(const char *c) {
+    pthread_mutex_lock(&cmd_lock);
+    if (ncmds < 16) snprintf(cmds[ncmds++], sizeof(cmds[0]), "%s", c);
+    pthread_mutex_unlock(&cmd_lock);
+}
+static bool read_at(int64_t j, int n, uint8_t *const dst[]);
+static bool wait_for(int64_t j, int n, double timeout);
+static int64_t wr_of(int m);
+
+/* The filtering: blocks from the rings as the engine reads them (a few blocks behind the newest), the band cut out
+ * and decimated, corrected, gathered into frames of a quarter of a second */
+static void *iq_worker(void *arg) {
+    df_chan_t      c;
+    bool           c_on = false;
+    uint8_t       *raw[DF_MAXCH] = {0};
+    float complex *dec[DF_MAXCH] = {0}, *acc = NULL, corr[DF_MAXCH];
+    int            n = 0, cpi = 0, pos = 0, ch_n = 0;
+    int64_t        j = -1, total = 0;
+    uint32_t       gen = ~0u, c_fc = 0, c_rate = 0, c_bw = 0, made = 0;
+    int32_t        c_off = 0;
+    bool           noisy = false, cal_ok = false;
+
+    (void)arg;
+    while (!atomic_load(&quit_now) && atomic_load(&iq_clients) > 0) {
+        int k = nch;
+
+        if (!k || !rate || !atomic_load(&streaming)) {
+            usleep(100000);
+            continue;
+        }
+        /* a new rate, centre, target or band: the filter and the frame begin again */
+        if (!c_on || c_fc != fc || c_rate != rate || c_off != f_off || c_bw != (uint32_t)iq_bw_set || ch_n != k) {
+            if (c_on) df_chan_free(&c);
+            n = (int)(rate / 10);
+            c_on = df_chan_init(&c, k, rate, f_off, iq_bw_set, n) == 0;
+            if (!c_on) {
+                usleep(200000);
+                continue;
+            }
+            for (int m = 0; m < DF_MAXCH; m++) {
+                free(raw[m]), free(dec[m]);
+                raw[m] = m < k ? malloc(2 * (size_t)n) : NULL;
+                dec[m] = m < k ? malloc(sizeof(float complex) * (size_t)n) : NULL;
+            }
+            for (cpi = 1024; cpi * 2 <= c.fs_out * 0.25; cpi *= 2) ;     /* a quarter of a second, a power of two */
+            free(acc);
+            acc = malloc(sizeof(float complex) * (size_t)cpi * (size_t)k);
+            c_fc = fc, c_rate = rate, c_off = f_off, c_bw = (uint32_t)iq_bw_set, ch_n = k;
+            j = -1, pos = 0, noisy = false;
+            if (!acc) break;
+        }
+        /* the calibration as it is now: its corrections at the band's centre (cal_lock: the engine changes it) */
+        if (gen != atomic_load(&cal_gen) || j < 0) {
+            pthread_mutex_lock(&cal_lock);
+            gen = atomic_load(&cal_gen);
+            cal_ok = have_cal;
+            for (int m = 0; m < k; m++) corr[m] = cal_ok ? df_cal_corr(&cal, m, f_off, rate) : 1;
+            j = wr_of(0) - 3 * n;                           /* a few blocks behind the newest, lined up again */
+            pthread_mutex_unlock(&cal_lock);
+            pos = 0, noisy = false;
+        }
+        if (!wait_for(j, n, 0.5)) continue;
+        pthread_mutex_lock(&cal_lock);
+        bool got = gen == atomic_load(&cal_gen) && read_at(j, n, raw);
+        pthread_mutex_unlock(&cal_lock);
+        if (!got) {
+            j = -1;
+            continue;
+        }
+        int64_t nf = atomic_load(&noise_from), nt = atomic_load(&noise_to);
+        if (nf >= 0 && j < (nt >= 0 ? nt : INT64_MAX) && j + n > nf) noisy = true;
+        j += n;
+        int got_n = df_chan_run(&c, (const uint8_t *const *)raw, n, dec);
+        for (int i = 0; i < got_n; i++) {
+            for (int m = 0; m < k; m++) acc[(size_t)m * (size_t)cpi + (size_t)pos] = dec[m][i] * corr[m];
+            if (++pos < cpi) continue;
+            /* a frame: published for the server, the newest only */
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            pthread_mutex_lock(&iq_lock);
+            size_t need = sizeof(float complex) * (size_t)cpi * (size_t)k;
+            if (iq_bytes != need) {
+                free(iq_frame);
+                iq_frame = malloc(need);
+                iq_bytes = iq_frame ? need : 0;
+            }
+            if (iq_frame) memcpy(iq_frame, acc, need);
+            memset(&iq_h, 0, sizeof(iq_h));
+            iq_h.sync_word = IQ_SYNC;
+            iq_h.frame_type = noisy ? IQ_CAL : cal_ok ? IQ_DATA : IQ_DUMMY;
+            snprintf(iq_h.hardware_id, sizeof(iq_h.hardware_id), "k5");
+            iq_h.active_ant_chs = (uint32_t)k;
+            iq_h.rf_center_freq = (uint64_t)((int64_t)fc + f_off);
+            iq_h.adc_sampling_freq = rate;
+            iq_h.sampling_freq = (uint64_t)llround(c.fs_out);
+            iq_h.cpi_length = (uint32_t)cpi;
+            iq_h.time_stamp = (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+            iq_h.daq_block_index = iq_h.cpi_index = made++;
+            total += cpi;
+            iq_h.ext_integration_cntr = (uint64_t)total;
+            iq_h.data_type = 3;                             /* decimated IQ, as Heimdall's decimator says it */
+            iq_h.sample_bit_depth = 32;                     /* complex float 32 */
+            for (int m = 0; m < k; m++) iq_h.if_gains[m] = (uint32_t)gain;
+            iq_h.delay_sync_flag = iq_h.iq_sync_flag = cal_ok;
+            iq_h.sync_state = cal_ok ? 6 : 0;
+            iq_h.noise_source_state = noisy;
+            iq_h.header_version = 7;
+            iq_seq++;
+            pthread_cond_broadcast(&iq_cond);
+            pthread_mutex_unlock(&iq_lock);
+            pos = 0, noisy = false;
+        }
+    }
+    if (c_on) df_chan_free(&c);
+    for (int m = 0; m < DF_MAXCH; m++) free(raw[m]), free(dec[m]);
+    free(acc);
+    pthread_mutex_lock(&iq_lock);
+    iq_worker_on = false;
+    pthread_mutex_unlock(&iq_lock);
+    return NULL;
+}
+
+static int listen_tcp(int port) {
+    int                fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0), one = 1;
+    struct sockaddr_in a = {.sin_family = AF_INET, .sin_port = htons((uint16_t)port), .sin_addr.s_addr = INADDR_ANY};
+
+    if (fd < 0) return -1;
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(fd, (struct sockaddr *)&a, sizeof(a)) || listen(fd, 1)) {
+        logf_("IQ server: port %d not open (%s)", port, strerror(errno));
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+static void set_timeouts(int fd, int sec) {
+    struct timeval tv = {sec, 0};
+
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+
+static bool send_all(int fd, const void *b, size_t n) {
+    const uint8_t *p = b;
+
+    while (n) {
+        ssize_t r = send(fd, p, n, MSG_NOSIGNAL);
+        if (r <= 0) return false;
+        p += r, n -= (size_t)r;
+    }
+    return true;
+}
+
+/* One client at a time on 5000: frames as it asks for them, the newest each time (a slow client skips some) */
+static void *iq_thread(void *arg) {
+    int lfd = *(int *)arg;
+
+    while (!atomic_load(&quit_now)) {
+        struct pollfd p = {.fd = lfd, .events = POLLIN};
+        if (poll(&p, 1, 500) <= 0) continue;
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) continue;
+        char     b[64];
+        uint32_t last = 0;
+        bool     first = true;
+
+        set_timeouts(fd, 10);
+        ssize_t r = recv(fd, b, sizeof(b) - 1, 0);             /* "streaming" */
+        if (r <= 0) {
+            close(fd);
+            continue;
+        }
+        atomic_store(&iq_clients, 1);
+        pthread_mutex_lock(&iq_lock);
+        last = iq_seq;
+        if (!iq_worker_on) {
+            pthread_t t;
+            iq_worker_on = pthread_create(&t, NULL, iq_worker, NULL) == 0;
+            if (iq_worker_on) pthread_detach(t);
+        }
+        pthread_mutex_unlock(&iq_lock);
+        logf_("IQ server: a client");
+        while (!atomic_load(&quit_now)) {
+            if (!first) {                                   /* the next frame asked for */
+                r = recv(fd, b, sizeof(b) - 1, 0);
+                if (r <= 0) break;
+                b[r] = 0;
+                if (strncmp(b, "IQDownload", 10)) break;
+            }
+            first = false;
+            /* the next new frame, then sent outside the lock (a copy: the worker goes on meanwhile) */
+            pthread_mutex_lock(&iq_lock);
+            struct timespec until;
+            clock_gettime(CLOCK_REALTIME, &until);
+            until.tv_sec += 3;
+            while (iq_seq == last && !atomic_load(&quit_now))
+                if (pthread_cond_timedwait(&iq_cond, &iq_lock, &until)) break;
+            bool     have = iq_seq != last && iq_frame;
+            iq_hdr_t h = iq_h;
+            size_t   nb = iq_bytes;
+            void    *copy = have ? malloc(nb) : NULL;
+            if (copy) memcpy(copy, iq_frame, nb);
+            last = iq_seq;
+            pthread_mutex_unlock(&iq_lock);
+            if (!copy) {                                    /* nothing yet (opening, no streams): a dummy frame */
+                memset(&h, 0, sizeof(h));
+                h.sync_word = IQ_SYNC, h.frame_type = IQ_DUMMY, h.header_version = 7, h.sample_bit_depth = 32;
+                snprintf(h.hardware_id, sizeof(h.hardware_id), "k5");
+                if (!send_all(fd, &h, sizeof(h))) break;
+                continue;
+            }
+            bool ok = send_all(fd, &h, sizeof(h)) && send_all(fd, copy, nb);
+            free(copy);
+            if (!ok) break;
+        }
+        close(fd);
+        atomic_store(&iq_clients, 0);
+        logf_("IQ server: the client went");
+    }
+    return NULL;
+}
+
+/* The control on 5001: what KrakenRF's software sends Heimdall's hardware controller */
+static void *ctl_thread(void *arg) {
+    int lfd = *(int *)arg;
+
+    while (!atomic_load(&quit_now)) {
+        struct pollfd p = {.fd = lfd, .events = POLLIN};
+        if (poll(&p, 1, 500) <= 0) continue;
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd < 0) continue;
+        set_timeouts(fd, 30);
+        while (!atomic_load(&quit_now)) {
+            uint8_t m[128];
+            ssize_t r = recv(fd, m, sizeof(m), MSG_WAITALL);
+            char    reply[128] = {0}, c[64];
+
+            if (r < 4) break;
+            if (!memcmp(m, "EXIT", 4)) break;
+            memcpy(reply, "FNSD", 4);
+            if (!memcmp(m, "FREQ", 4) && r >= 12) {
+                uint64_t hz;
+                memcpy(&hz, m + 4, sizeof(hz));
+                if (hz >= 24000000ull && hz <= 1766000000ull) {
+                    snprintf(c, sizeof(c), "F %llu", (unsigned long long)hz);
+                    queue_cmd(c);
+                    logf_("IQ control: FREQ %.4f MHz", hz / 1e6);
+                } else {
+                    memcpy(reply, "FAIL", 4);
+                }
+            } else if (!memcmp(m, "GAIN", 4) && r >= 8) {
+                uint32_t g;
+                memcpy(&g, m + 4, sizeof(g));
+                snprintf(c, sizeof(c), "g %u", g);
+                queue_cmd(c);
+            } else if (memcmp(m, "INIT", 4) && memcmp(m, "AGC ", 4)) {
+                memcpy(reply, "FAIL", 4);
+            }
+            if (!send_all(fd, reply, sizeof(reply))) break;
+        }
+        close(fd);
+    }
+    return NULL;
+}
+
+static void iq_start(void) {
+    static int iq_fd = -1, ctl_fd = -1;
+    pthread_t  t;
+
+    if (iq_bw_set <= 0) return;
+    if ((iq_fd = listen_tcp(IQ_PORT)) >= 0 && pthread_create(&t, NULL, iq_thread, &iq_fd) == 0) pthread_detach(t);
+    if ((ctl_fd = listen_tcp(CTL_PORT)) >= 0 && pthread_create(&t, NULL, ctl_thread, &ctl_fd) == 0) pthread_detach(t);
+    if (iq_fd >= 0) logf_("IQ server: Heimdall's protocol on %d (control %d), %d Hz around the target", IQ_PORT, CTL_PORT,
+                          iq_bw_set);
+}
+
 /* ------------------------------------------------------------------------------------------------- the worker */
 
 static df_engine_t eng;
@@ -768,7 +1099,10 @@ static void send_state(void);
 static void coarse_align(void) {
     double t00 = atomic_load(&ch[0].t0);
 
+    pthread_mutex_lock(&cal_lock);
     for (int m = 0; m < nch; m++) kb[m] = llround((t00 - atomic_load(&ch[m].t0)) * rate);
+    atomic_fetch_add(&cal_gen, 1);
+    pthread_mutex_unlock(&cal_lock);
 }
 
 static float pw_mean(const float complex *x, int n) {
@@ -802,10 +1136,13 @@ static bool calibrate(bool search) {
         pre[m] = pw_mean(x[m], 16384);
     }
 
+    atomic_store(&noise_to, -1);
+    atomic_store(&noise_from, wr_of(0));            /* the IQ server marks frames over it as CAL */
     dev_noise(true);
     j = wr_of(0) + (int64_t)(SETTLE_S * rate);
     if (!wait_for(j, n, 3)) {
         dev_noise(false);
+        atomic_store(&noise_to, wr_of(0) + (int64_t)(SETTLE_S * rate));
         goto failed;
     }
     {
@@ -819,6 +1156,7 @@ static bool calibrate(bool search) {
     }
     dev_noise(false);
     J = wr_of(0) + (int64_t)(SETTLE_S * rate);  /* estimates again once the antennas are back */
+    atomic_store(&noise_to, J);
 
     float rises[DF_MAXCH];
 
@@ -843,9 +1181,12 @@ static bool calibrate(bool search) {
             goto failed;
         }
     }
+    pthread_mutex_lock(&cal_lock);
     for (int m = 1; m < nch; m++) kb[m] += c.k[m];
     cal = c;
     have_cal = true;
+    atomic_fetch_add(&cal_gen, 1);
+    pthread_mutex_unlock(&cal_lock);
     cal_at = now_s();
     cals++;
     why[0] = 0;
@@ -923,6 +1264,7 @@ static void send_state(void) {
     s.cpu_pct = (uint8_t)cpu_pct;
     s.nsrc_set = (uint8_t)(eng.nsrc < 0 ? 0 : eng.nsrc ? eng.nsrc : 1);
     s.fb = eng.fb;
+    s.iq_clients = (uint8_t)((atomic_load(&iq_clients) ? 1 : 0) | (atomic_load(&iq_tuned) ? 2 : 0));
     snprintf(s.why, sizeof(s.why), "%s", why[0] ? why : note);
     for (int m = 0; m < nch && m < DF_PROTO_MAXCH; m++) {
         df_ch_t *c = &s.ch[m];
@@ -1051,7 +1393,20 @@ static int apply(const char *c) {
     df_array_t na;
 
     switch (c[0]) {
+        case 'F':                                       /* an IQ program's FREQ: the Kraken a quarter of the rate
+                                                         * under it, the target on it (as page I's bands) */
+            if (sscanf(c + 1, "%lf", &a) == 1 && a >= 24e6 && a <= 1766e6) {
+                f_off = (int32_t)(rate / 4);
+                fc = (uint32_t)(a - f_off);
+                if (dev_is_open) dev_tune();
+                eng.fc = fc;
+                if (eng_on) df_engine_retarget(&eng, f_off);
+                atomic_store(&iq_tuned, true);
+                return 1;
+            }
+            break;
         case 'f':
+            atomic_store(&iq_tuned, false);             /* the GUI tunes again */
             if (sscanf(c + 1, "%lf", &a) == 1 && a >= 24e6 && a <= 1766e6 && (uint32_t)a != fc) {
                 fc = (uint32_t)a;
                 if (dev_is_open) dev_tune();
@@ -1335,7 +1690,7 @@ int main(int argc, char **argv) {
     double      a = 0, b = 0;
 
     df_array_uca(&arr, 5, 0.294);               /* the calculator at 433.92 MHz, s 0.5 */
-    while ((o = getopt(argc, argv, "FS:pf:s:g:t:a:m:i:n:DT:C:")) != -1) {
+    while ((o = getopt(argc, argv, "FS:pf:s:g:t:a:m:i:n:DT:C:I:")) != -1) {
         switch (o) {
             case 'F': front = true; break;
             case 'S': sock_name = optarg; break;
@@ -1365,6 +1720,7 @@ int main(int argc, char **argv) {
                 if ((n_open = atoi(optarg)) < 2 || n_open > NCH_KRAKEN) return 1;
                 break;
             case 'D': dither_on = true; break;
+            case 'I': iq_bw_set = atoi(optarg); break;
             case 'C':
                 if (!strcmp(optarg, "off")) cores_on = false;
                 else if (sscanf(optarg, "%d,%d,%d", &cpu_readers, &cpu_engine, &rt_prio) < 2) return 1;
@@ -1425,6 +1781,7 @@ int main(int argc, char **argv) {
     bool      th_on = ls >= 0 && pthread_create(&th, NULL, sock_thread, NULL) == 0;
     pthread_t gth;
 
+    iq_start();                         /* Heimdall's IQ server, for other programs */
     df_gps_init(&gps);
     if (pthread_create(&gth, NULL, gps_thread, NULL) == 0) pthread_detach(gth);     /* gpsd, when it runs */
 
