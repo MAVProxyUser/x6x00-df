@@ -517,7 +517,7 @@ static void test_slip(int lost, int must_catch) {
     engine_for(&e, &arr);
     df_engine_set_cal(&e, &cal);
     double caught = -1, worst = 0, minfit = 1;
-    int    bad = -1;
+    int    bad = -1, bc = -1;
 
     for (int b = 0; b < nb && caught < 0; b++) {
         run(&e, ch, &cal, b, 1, &est);
@@ -527,13 +527,24 @@ static void test_slip(int lost, int must_catch) {
         if (b >= at) {
             if (est.gate) worst = fmax(worst, angdiff(est.doa.bearing, 37));
             minfit = fmin(minfit, est.doa.fit);
-            if (est.cal_wanted == 1) caught = (b + 1 - at - 0.5) * 0.1, bad = est.bad_ch;
+            if (est.cal_wanted == 1) caught = (b + 1 - at - 0.5) * 0.1, bad = est.bad_ch, bc = b;
         }
     }
     if (must_catch) {
         check(caught >= 0 && caught <= 1.0 && bad == 3, "slip of %d samples: caught %.2f s after (1 s), channel %d (3)",
               lost, caught, bad);
         check(worst < 5, "slip of %d samples: worst bearing shown meanwhile %.1f degrees off", lost, worst);
+        if (bc >= 0) {                  /* the caller's hold (no slip found last time): none asked within it, one after */
+            int again = 0, later = 0;
+
+            e.slip_hold_s = 30;
+            e.last_slip_cal = e.now - 15;
+            for (int b = bc + 1; b < bc + 6; b++) run(&e, ch, &cal, b, 1, &est), again += est.cal_wanted == 1;
+            e.last_slip_cal = e.now - 31;
+            for (int b = bc + 6; b < bc + 11; b++) run(&e, ch, &cal, b, 1, &est), later += est.cal_wanted == 1;
+            check(!again && later == 1, "slip of %d samples, a 30 s hold: none asked 15 s on (%d), one past it (%d)", lost,
+                  again, later);
+        }
         hw[3].D -= lost;                                    /* what a new calibration sees */
         df_cal_t c2;
         int      stale = calibrate_k(hw, 5, cal.k, &c2);

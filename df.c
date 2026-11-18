@@ -138,6 +138,20 @@ static double   last_good_at = -1, last_bearing = -1, last_mirror = -1, last_unc
 #define HOLD_FIT    0.50
 static double   held_bearing = -1, held_mirror = -1, held_uncert, held_fit;
 static bool     slip_shown;
+/* A slip is taken for one only once the calibration it asked for finds a stick moved (a whole-sample delay or a phase
+ * at 0 Hz SLIP_DEG or more from the last one's). With nothing moved the fit fell for the antennas or the signal (an
+ * array no plane wave fits: unequal cables, the geometry set wrong, multipath), and calibrating again cures nothing:
+ * the next look waits twice as long, up to SLIP_HOLD_MAX_S, back to SLIP_HOLD_S on a real one or a retune. Indoors
+ * on FM through five whips in a line of no known spacing it asked every 10-25 s, every one finding the same delays
+ * (2026-11-17) */
+#define SLIP_HOLD_S     10.0
+#define SLIP_HOLD_MAX_S 600.0
+#define SLIP_DEG        10.0
+static double   slip_hold = SLIP_HOLD_S, hold_fc = -1, hold_f;
+static bool     search_ok, cal_moved;           /* the last searching calibration (calibrate(true)): done, and what it
+                                                 * found */
+static int      moved_ch = -1, moved_k, moved_deg_ch = -1;
+static double   moved_deg;
 
 static double now_s(void) {
     struct timespec t;
@@ -1096,6 +1110,8 @@ static void engine_setup(void) {
     eng.sql_db = sql / 10.0;
     eng.cal_every_s = cal_every > 0 ? cal_every : -1;
     eng.user_off = user_off;
+    if (fc != hold_fc || f_off != hold_f) slip_hold = SLIP_HOLD_S, hold_fc = fc, hold_f = f_off;
+    eng.slip_hold_s = slip_hold;
     blk_n = (int)(rate / 10);
     eng_on = df_engine_init(&eng, blk_n) == 0;
     if (!eng_on) logf_("engine: could not start (%d channels, array of %d)", eng.nch, arr.n);
@@ -1388,6 +1404,7 @@ static bool calibrate(bool search) {
     int64_t               j;
     bool                  ok = false;
 
+    if (search) search_ok = false;
     for (int m = 0; m < nch; m++)
         if (!x[m] && !(x[m] = malloc(sizeof(float complex) * (size_t)n))) return false;
     st = DF_ST_CAL;
@@ -1448,6 +1465,17 @@ static bool calibrate(bool search) {
         }
     }
     pthread_mutex_lock(&cal_lock);
+    if (search) {                       /* moved since the last? (none before: as good as moved) */
+        cal_moved = !have_cal, moved_ch = moved_deg_ch = -1, moved_k = 0, moved_deg = 0;
+        for (int m = 1; m < nch && have_cal; m++) {
+            double d = fabs(remainder((c.phi[m] - cal.phi[m]) * 180 / M_PI, 360));
+
+            if (c.k[m] && moved_ch < 0) moved_ch = m, moved_k = c.k[m];
+            if (d > moved_deg) moved_deg = d, moved_deg_ch = m;
+        }
+        cal_moved |= moved_ch >= 0 || moved_deg >= SLIP_DEG;
+        search_ok = true;
+    }
     for (int m = 1; m < nch; m++) kb[m] += c.k[m];
     cal = c;
     have_cal = true;
@@ -1928,6 +1956,24 @@ static void tau_text(char *b, size_t n) {
     for (int m = 1; m < nch && l < n; m++) l += (size_t)snprintf(b + l, n - l, " CH%d %+.3f", m, cal.tau[m]);
 }
 
+/* After a slip's calibration: a slip only if it found a stick moved (or could not calibrate); else the next look
+ * waits longer. By the searching calibration's own result (one after a slew failing says nothing of a slip) */
+static void slip_verdict(void) {
+    if (!search_ok || cal_moved) {
+        slips++;
+        slip_hold = SLIP_HOLD_S;
+        if (!search_ok) logf_("slip (%d so far): the calibration failed", slips);
+        else if (moved_ch >= 0) logf_("slip (%d so far): CH%d %+d samples", slips, moved_ch, moved_k);
+        else if (moved_deg_ch >= 0) logf_("slip (%d so far): CH%d's phase %.0f deg off", slips, moved_deg_ch, moved_deg);
+        else logf_("slip (%d so far)", slips);
+    } else {
+        slip_hold = fmin(slip_hold * 2, SLIP_HOLD_MAX_S);
+        logf_("no slip: every stick where it was (phases within %.1f deg); the antennas or the signal fit no plane "
+              "wave, the next look in %.0f s", moved_deg, slip_hold);
+    }
+    eng.slip_hold_s = slip_hold;
+}
+
 /* a calibration, and the sticks slewed into line after it when wanted */
 static bool calibrate_aligned(bool search) {
     bool ok = calibrate(search);
@@ -2088,10 +2134,9 @@ static void run(bool print) {
             double t = now_s();
 
             if (e.cal_wanted == 1) {
-                slips++;
                 slip_shown = true;
-                if (e.bad_ch >= 0) logf_("slip on CH%d (%d so far): calibrating again", e.bad_ch, slips);
-                else logf_("slip (%d so far): calibrating again", slips);
+                if (e.bad_ch >= 0) logf_("slip on CH%d?: calibrating to see", e.bad_ch);
+                else logf_("slip? (no plane wave fits): calibrating to see");
             }
             st = !have_cal ? DF_ST_NOCAL
                : slip_shown ? DF_ST_SLIP
@@ -2103,8 +2148,10 @@ static void run(bool print) {
             send_targets(seq);
             seq++;
             if (print) print_est(&e);
-            if (e.cal_wanted) calibrate_aligned(e.cal_wanted == 1);
-            else if (have_cal && atomic_exchange(&slew_due, false) && slew_wanted()) calibrate_aligned(false);
+            if (e.cal_wanted) {
+                calibrate_aligned(e.cal_wanted == 1);
+                if (e.cal_wanted == 1) slip_verdict();
+            } else if (have_cal && atomic_exchange(&slew_due, false) && slew_wanted()) calibrate_aligned(false);
 
             /* the state twice a second, the CPU and gpsd's view once a second */
             if (t - last_st >= 0.5) {

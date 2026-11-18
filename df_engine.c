@@ -12,7 +12,8 @@
  *    - every channel through the channel filter, times its calibration at the target's frequency; R from that;
  *    - DoA; the gate: calibrated, the squelch open three blocks running, one source across the array, the fit;
  *    - a slip: with 4 elements or more, one channel the rest fit well without (0.9, and 0.1 over all of them); or the
- *      target 15 dB up and the fit under 0.5. The gate shuts at once, a calibration after 0.3 s (once in 10 s at most).
+ *      target 15 dB up and the fit under 0.5. The gate shuts at once, a calibration after 0.3 s (once in slip_hold_s,
+ *      10, at most: the caller lengthens it while the calibrations find nothing moved, an array no plane wave fits).
  *      (One channel turned 180 degrees can still look like a plane wave from the other side: the fit alone misses it);
  *    - the timer: once the squelch has been shut 0.3 s, or 30 s past due.
  */
@@ -43,6 +44,7 @@ int df_engine_init(df_engine_t *e, int cap) {
     if (!e->eig_min_db) e->eig_min_db = 6;
     if (!e->fit_min) e->fit_min = 0.5;
     if (!e->cal_every_s) e->cal_every_s = 120;
+    if (!e->slip_hold_s) e->slip_hold_s = 10;
     if (!e->nsrc) e->nsrc = 1;
     if (!e->bw) e->bw = 12500;
     e->cap = cap;
@@ -298,7 +300,7 @@ int df_engine_block(df_engine_t *e, const uint8_t *const iq[], int n, df_est_t *
         e->low_fit += dt;
     } else
         e->low_fit = 0;
-    if (e->low_fit >= 0.3 && e->now - e->last_slip_cal >= 10) {
+    if (e->low_fit >= 0.3 && e->now - e->last_slip_cal >= e->slip_hold_s) {
         o->cal_wanted = 1;
         e->last_slip_cal = e->now;
         e->low_fit = 0;

@@ -25,7 +25,8 @@ Receive only: nothing here transmits.
   the USB host's interrupt moved off CPU0 (`-C`).
 - Says how far to trust it: a fit (0-100 %), a +- wedge, the other peaks; holds the last good bearing for 30 s when
   the signal stops; leaves out a channel 20 dB under the rest (a dead antenna or cable); catches a sample slip and
-  calibrates again.
+  calibrates again, counting it only when that calibration finds a stick moved (a fit that falls for the antennas or
+  the signal, which no calibration cures, is looked at again less and less often, up to every 10 minutes).
 - Talks to one client, the GUI's page I, on the abstract socket `@x6x00-df` (`SOCK_SEQPACKET`): binary messages out
   (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum, DFGP gpsd, DFTG the other targets), short text
   commands in.

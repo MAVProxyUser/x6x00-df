@@ -196,6 +196,8 @@ typedef struct {
     double      eig_min_db;             /* one source across the array (default 6) */
     double      fit_min;                /* a plane wave explains it (default 0.5) */
     double      cal_every_s;            /* the timer (default 120; negative: never) */
+    double      slip_hold_s;            /* a slip's calibration once in this long at most (default 10); the caller
+                                         * lengthens it while those calibrations find every stick where it was */
 
     /* inside */
     df_chan_t      chan;
