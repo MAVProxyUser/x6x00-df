@@ -171,6 +171,10 @@ int df_smooth(const double complex *R, int n, int p, double complex *Rs);
 int df_poly_roots(const double complex *c, int d, double complex *z);
 /* An array of elements on a line at its spacing in order (a ULA, no element left out) */
 bool df_uniform_line(const df_array_t *a);
+/* A custom array standing on one line across (every x the same, to a millimetre) made a line (DF_ULA): searched in
+ * front only with its mirror, as any line must be, at any spacings (a minimum-redundancy line, one measured by hand);
+ * moved to x 0, its size the mean spacing, so an even one is a uniform line too. true if it was */
+bool df_custom_line(df_array_t *a);
 
 /* Each channel left out in turn: the best Bartlett fit of the rest, at any bearing. One channel whose absence makes
  * the rest fit (a slip, or a bad cable) stands out */
@@ -227,6 +231,18 @@ typedef struct {
     float          spec_db[1024];       /* CH0's last spectrum, dBFS, lowest frequency first */
     float          win[1024];           /* Hann */
     double         floor_db;            /* its median bin */
+
+    /* The antenna side (df_engine_set_ant): each channel's phase between its antenna and the noise source's way in
+     * (its cable, its whip), degrees with CH0 0, taken out after the noise source's calibration. And a calibration
+     * on a source at a known bearing being taken (df_engine_ant_take): the covariance of every channel summed over
+     * the blocks the target is over the squelch */
+    double         ant_ph[DF_MAXCH];
+    bool           ant_on;
+    bool           ant_taking;
+    double         ant_brg, ant_need, ant_got, ant_waited;
+    double complex ant_R[DF_MAXCH * DF_MAXCH];
+    int            ant_blocks;
+    char           ant_why[64];
 } df_engine_t;
 
 /* A dead antenna: the target this far under the median of the others for a second; back in once within the second.
@@ -248,11 +264,32 @@ typedef struct {
     double   ch_db[DF_MAXCH];           /* the target's strongest bin over each channel's own floor */
     double   clip[DF_MAXCH];            /* share of each channel's bytes at 0 or 255 */
     df_doa_t doa;                       /* bad_ch and the bearing are in whole-array channel numbers */
+
+    /* a calibration on a source at a known bearing (df_engine_ant_take) */
+    double   ant_pct;                   /* while it is taken: the share gathered, 0-1 */
+    int      ant_done;                  /* it ended with this block: 1 taken, -1 failed (the engine's ant_why) */
+    double   ant_ph[DF_MAXCH];          /* taken: the antenna side's phases (degrees, CH0 0), those already taken out
+                                         * included; df_engine_set_ant them to use them */
+    double   ant_share[DF_MAXCH];       /* taken: the share of each channel's power the source explains */
+    double   ant_fit0, ant_fit1;        /* taken: the fit at its bearing before and with them */
+    double   ant_eig_db;                /* taken or failed: the strongest eigenvalue over the next */
 } df_est_t;
 
 int  df_engine_init(df_engine_t *e, int cap);
 void df_engine_free(df_engine_t *e);
 void df_engine_set_cal(df_engine_t *e, const df_cal_t *c);
 void df_engine_retarget(df_engine_t *e, double f);
+/* The antenna side's phases (degrees, CH0 0) taken out of every channel from now on; NULL none */
+void df_engine_set_ant(df_engine_t *e, const double *ph_deg);
+/* Take a calibration on one source at bearing brg (degrees from the array's forward, as the bearings): secs of it
+ * over the squelch, every channel's antenna side measured against what the array's geometry gives there. Ends
+ * (ant_done) once it has them, or fails: nothing over the squelch for 15 s plus secs, or not one source (the
+ * strongest eigenvalue under 6 dB over the next); a retune ends it as failed */
+void df_engine_ant_take(df_engine_t *e, double brg, double secs);
+/* What a source at brg gives each channel after the noise source's calibration (raw: degrees, CH0 0) and the
+ * antenna side's phases (ph) are the array's own phases there apart: one from the other, for a (lambda: the
+ * wavelength the source was at) */
+void df_ant_of_raw(const df_array_t *a, double lambda, double brg, const double *raw, double *ph);
+void df_raw_of_ant(const df_array_t *a, double lambda, double brg, const double *ph, double *raw);
 /* one block of aligned u8 I/Q per channel (n samples, n <= cap): an estimate always (gate says if it counts) */
 int  df_engine_block(df_engine_t *e, const uint8_t *const iq[], int n, df_est_t *out);

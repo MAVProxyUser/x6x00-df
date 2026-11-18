@@ -11,6 +11,7 @@
  *    DFSP  CH0's spectrum across the whole passband                  every block
  *    DFGP  gpsd: the fix and the heading the bearings may take       once a second (all 0 / -1 without gpsd)
  *    DFTG  the other targets' bearings (1|2|3)                       every block while one is set
+ *    DFAC  the antenna side's calibration (b, B)                     with DFST, and on any change
  *
  *  GUI to daemon: one text command per packet, ASCII, no newline needed:
  *    f HZ                  the tuners' centre
@@ -31,6 +32,10 @@
  *    l 0|1                 the bearing log (/mnt/df_log, a CSV file a day) off or on
  *    h DEG                 the heading set by hand on page I (the log's compass bearings when gpsd has none)
  *    c                     calibrate now
+ *    b DEG                 calibrate the antenna side on one source at DEG (from the array's forward, as the bearings)
+ *                          now at the target: a few seconds of it over the squelch (DFAC says how it went); kept on
+ *                          the card for this frequency, used within 2 % of it
+ *    B                     forget the antenna side's calibration in use (the one nearest the target)
  *    Q                     end (the sticks closed, the noise source off)
  */
 
@@ -185,5 +190,28 @@ typedef struct {
     uint32_t seq;               /* the DFDO it came with */
     df_tg_t  tg[DF_PROTO_TARGETS];
 } df_tg_msg_t;
+
+/* the antenna side's calibration (b DEG, B): cables and whips in front of where the noise source comes in */
+enum {
+    DF_AC_IDLE = 0,     /* none asked for since the daemon started */
+    DF_AC_TAKING,       /* gathering the source (pct) */
+    DF_AC_DONE,         /* the last one taken (fit0 -> fit1), now in use */
+    DF_AC_FAILED,       /* the last one failed (why) */
+};
+
+typedef struct {
+    char     tag[4];            /* "DFAC" */
+    uint8_t  state;             /* DF_AC_* (the last take) */
+    uint8_t  pct;               /* taking: 0-100 */
+    uint8_t  fit0_pct, fit1_pct;/* the last take: the fit at its bearing before and with it */
+    uint8_t  n;                 /* calibrations kept (/mnt/df_antcal.txt), one a frequency */
+    uint8_t  in_use;            /* 1: one is applied (use_hz) */
+    int16_t  use_brg_ddeg;      /* the one in use: its source's bearing (tenths of a degree from forward) */
+    uint32_t use_hz;            /* the one in use: the frequency it was taken at */
+    uint32_t use_age_s;         /* how long ago it was taken (0xffffffff not known) */
+    int16_t  take_brg_ddeg;     /* the last take's bearing */
+    int16_t  ph_ddeg[DF_PROTO_MAXCH];   /* the phases taken out now, per channel (CH0 0), tenths of a degree */
+    char     why[56];           /* the last take: failed, why */
+} df_ac_msg_t;
 
 #pragma pack(pop)

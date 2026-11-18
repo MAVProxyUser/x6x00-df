@@ -88,6 +88,9 @@ typedef struct {
     int    flat;                        /* the same phase at every element (no direction in the plane) */
 } src_t;
 
+/* the antenna side: each element's cable and whip, in front of where the noise source comes in (radians) */
+static double ant_phi[DF_MAXCH];
+
 static uint8_t q8(double x, double scale) {
     long v = lround(127.5 + x * scale);
 
@@ -123,7 +126,7 @@ static uint8_t **gen(const hw_t *hw, const df_array_t *arr, const src_t *src, in
 
                 y += A * cexp(I * ph);
             }
-            y = hw[m].g * cexp(I * hw[m].phi) * y + (gauss() + I * gauss()) * sqrt(0.5);
+            y = hw[m].g * cexp(I * hw[m].phi) * cexp(I * ant_phi[m]) * y + (gauss() + I * gauss()) * sqrt(0.5);
             ch[m][2 * i] = q8(creal(y), scale);
             ch[m][2 * i + 1] = q8(cimag(y), scale);
         }
@@ -866,6 +869,164 @@ static void test_two_targets(void) {
     free_ch(ch, 5);
 }
 
+/* The antenna side (cables of unequal lengths): the noise source cannot see it, a source at a known bearing can.
+ * Taken on one source, used on another at another bearing; a line and a circle; two sources at once refused */
+static void ant_case(const df_array_t *arr, const char *name, double take_at, double then_at) {
+    hw_t        hw[5];
+    df_cal_t    cal;
+    df_engine_t e;
+    df_est_t    est;
+    static const double err_deg[5] = {0, 40, 150, -70, 100};
+    int         n = arr->n, nb = 14;
+
+    hw_random(hw, n);
+    calibrate(hw, n, &cal);
+    for (int m = 0; m < n; m++) ant_phi[m] = err_deg[m] * M_PI / 180;
+
+    src_t     a = nfm(take_at, 20);
+    uint8_t **ch = gen(hw, arr, &a, 1, START * 2 + (nb + 1) * BLOCK, 0);
+
+    engine_for(&e, arr);
+    df_engine_set_cal(&e, &cal);
+    run(&e, ch, &cal, 0, 3, &est);
+    double fit_before = est.doa.fit;
+
+    df_engine_ant_take(&e, take_at, 1.0);
+    int b = 3;
+
+    do run(&e, ch, &cal, b++, 1, &est);
+    while (!est.ant_done && b < nb);
+    double worst = 0;
+
+    for (int m = 0; m < n; m++) worst = fmax(worst, angdiff(est.ant_ph[m], err_deg[m]));
+    check(est.ant_done == 1 && worst < 2, "%s, taken at %.0f: the antenna side within %.2f deg (2), fit %.0f %% -> %.0f %%",
+          name, take_at, worst, 100 * est.ant_fit0, 100 * est.ant_fit1);
+    check(est.ant_fit1 > 0.9 && est.ant_fit0 < 0.6, "%s: the fit at its bearing %.2f before, %.2f with it (the best "
+          "bearing's before: %.2f)", name, est.ant_fit0, est.ant_fit1, fit_before);
+    double ph[DF_MAXCH];
+
+    memcpy(ph, est.ant_ph, sizeof(ph));
+    free_ch(ch, n);
+
+    /* in use, on another source elsewhere */
+    src_t s2 = nfm(then_at, 20);
+
+    ch = gen(hw, arr, &s2, 1, START * 2 + 4 * BLOCK, 0);
+    df_engine_set_ant(&e, ph);
+    run(&e, ch, &cal, 0, 3, &est);
+    check(est.gate && angdiff(est.doa.bearing, then_at) < 1 && est.doa.fit > 0.9,
+          "%s: with it, a source at %.0f: bearing %.2f, fit %.2f, gate %d", name, then_at, est.doa.bearing, est.doa.fit,
+          est.gate);
+    df_engine_set_ant(&e, NULL);
+    run(&e, ch, &cal, 0, 3, &est);
+    check(!est.gate || angdiff(est.doa.bearing, then_at) > 3, "%s: without it, a source at %.0f: bearing %.2f fit %.2f (wrong)",
+          name, then_at, est.doa.bearing, est.doa.fit);
+    free_ch(ch, n);
+
+    /* raw <-> antenna side round trip */
+    double raw[DF_MAXCH], back[DF_MAXCH], lam = DF_C / (FC + FOFF), rt = 0;
+
+    df_raw_of_ant(arr, lam, take_at, ph, raw);
+    df_ant_of_raw(arr, lam, take_at, raw, back);
+    for (int m = 0; m < n; m++) rt = fmax(rt, angdiff(back[m], ph[m]));
+    check(rt < 1e-9, "%s: raw and back, %.2g deg", name, rt);
+    df_engine_free(&e);
+    memset(ant_phi, 0, sizeof(ant_phi));
+}
+
+static void test_antenna_side(void) {
+    df_array_t line, circle;
+    double      lam = DF_C / (FC + FOFF);
+
+    df_array_ula(&line, 5, 0.45 * lam);
+    df_array_uca(&circle, 5, 0.5 * lam / (2 * sin(M_PI / 5)));
+    ant_case(&line, "ULA-5", 25, 320);
+    ant_case(&circle, "UCA-5", 100, 230);
+
+    /* two sources as strong at once: refused, not taken */
+    hw_t        hw[5];
+    df_cal_t    cal;
+    df_engine_t e;
+    df_est_t    est;
+    src_t       two[2] = {nfm(30, 20), nfm(300, 20)};
+
+    two[1].f += 400;
+    two[1].dev1 = 2500, two[1].fm1 = 650;
+    hw_random(hw, 5);
+    calibrate(hw, 5, &cal);
+    uint8_t **ch = gen(hw, &circle, two, 2, START * 2 + 6 * BLOCK, 0);
+
+    engine_for(&e, &circle);
+    df_engine_set_cal(&e, &cal);
+    df_engine_ant_take(&e, 30, 0.3);
+    int b = 0;
+
+    do run(&e, ch, &cal, b++, 1, &est);
+    while (!est.ant_done && b < 5);
+    check(est.ant_done == -1 && !e.ant_on, "two sources at once: refused (%s)", e.ant_why);
+    /* a retune while taking ends it */
+    df_engine_ant_take(&e, 30, 0.3);
+    df_engine_retarget(&e, FOFF + 25000);
+    check(!e.ant_taking && e.ant_why[0], "a retune while taking: ended (%s)", e.ant_why);
+    df_engine_free(&e);
+    free_ch(ch, 5);
+}
+
+/* Five antennas as the GUI's new layouts send them (positions, a custom): the minimum-redundancy line (0, 1, 4, 7, 9
+ * units of half a wave) taken as a line, front only with its mirror; 4 round 1 and the L all round */
+static void test_layouts(void) {
+    double lam = DF_C / (FC + FOFF), u = 0.5 * lam;
+    struct {
+        const char *name;
+        double      x[5], y[5];
+        double      at[3];
+        bool        line;
+    } L[] = {
+        {"MRL-5", {0.02, 0.02, 0.02, 0.02, 0.02}, {4.5 * u, 3.5 * u, 0.5 * u, -2.5 * u, -4.5 * u}, {0, 37, 300}, true},
+        {"4+1", {0.7 * u, 0, -0.7 * u, 0, 0}, {0, -0.7 * u, 0, 0.7 * u, 0}, {0, 100, 230}, false},
+        {"L-5", {-0.6 * u, 0.4 * u, 1.4 * u, -0.6 * u, -0.6 * u}, {0.6 * u, 0.6 * u, 0.6 * u, -0.4 * u, -1.4 * u}, {10, 170, 260}, false},
+    };
+
+    for (int l = 0; l < 3; l++) {
+        df_array_t arr;
+        hw_t       hw[5];
+        df_cal_t   cal;
+
+        memset(&arr, 0, sizeof(arr));
+        arr.kind = DF_CUSTOM, arr.n = 5;
+        for (int m = 0; m < 5; m++) arr.x[m] = L[l].x[m], arr.y[m] = L[l].y[m];
+        bool line = df_custom_line(&arr);
+
+        check(line == L[l].line && (!line || (arr.kind == DF_ULA && !df_uniform_line(&arr))),
+              "%s: taken as a line %d (%d), uniform %d", L[l].name, line, L[l].line, df_uniform_line(&arr));
+        hw_random(hw, 5);
+        calibrate(hw, 5, &cal);
+        for (int i = 0; i < 3; i++) {
+            df_engine_t e;
+            df_est_t    est;
+            src_t       s = nfm(L[l].at[i], 20);
+            uint8_t   **ch = gen(hw, &arr, &s, 1, START * 2 + 4 * BLOCK, 0);
+
+            engine_for(&e, &arr);
+            df_engine_set_cal(&e, &cal);
+            run(&e, ch, &cal, 0, 3, &est);
+            check(est.gate && angdiff(est.doa.bearing, L[l].at[i]) < 1 && (line ? est.doa.mirror >= 0 : est.doa.mirror < 0),
+                  "%s at %.0f: bearing %.2f, mirror %.1f, fit %.2f", L[l].name, L[l].at[i], est.doa.bearing, est.doa.mirror,
+                  est.doa.fit);
+            df_engine_free(&e);
+            free_ch(ch, 5);
+        }
+    }
+    /* an even line given as positions is the uniform line itself */
+    df_array_t a;
+
+    memset(&a, 0, sizeof(a));
+    a.kind = DF_CUSTOM, a.n = 5;
+    for (int m = 0; m < 5; m++) a.x[m] = 0.1, a.y[m] = 0.58 - m * 0.29;
+    check(df_custom_line(&a) && df_uniform_line(&a) && fabs(a.size - 0.29) < 1e-9, "an even custom line: uniform, %.3f m",
+          a.size);
+}
+
 int main(int argc, char **argv) {
     verbose = argc > 1 && !strcmp(argv[1], "-v");
     test_calc();
@@ -885,6 +1046,8 @@ int main(int argc, char **argv) {
     test_root_music();
     test_smoothing();
     test_two_targets();
+    test_antenna_side();
+    test_layouts();
     printf("df_test: %d checks, %d failed\n", checks, fails);
     return fails ? 1 : 0;
 }

@@ -16,7 +16,8 @@ Receive only: nothing here transmits.
   slip, and every two minutes by default.
 - Takes a bearing on every 0.1 s block with MUSIC, Bartlett, Capon, MEM, TNA or ROOT-MUSIC (a straight array's
   bearings from a polynomial's roots, off any grid), for a circular (UCA-3/4/5), straight (ULA-3/4/5) or any other
-  layout of up to five antennas, through a channel filter on the target, above a squelch; one source, two or three
+  layout of up to five antennas (one standing on a single line across is taken as a line, at any spacings: a
+  minimum-redundancy line, one measured by hand), through a channel filter on the target, above a squelch; one source, two or three
   (their bearings together), or as many as the eigenvalues show (AUTO); forward-backward averaging and spatial
   smoothing on a ULA for coherent sources such as multipath.
 - With gpsd running: a compass's heading, or the course over the ground while moving, turns bearings into compass
@@ -28,7 +29,8 @@ Receive only: nothing here transmits.
   calibrates again, counting it only when that calibration finds a stick moved (a fit that falls for the antennas or
   the signal, which no calibration cures, is looked at again less and less often, up to every 10 minutes).
 - Talks to one client, the GUI's page I, on the abstract socket `@x6x00-df` (`SOCK_SEQPACKET`): binary messages out
-  (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum, DFGP gpsd, DFTG the other targets), short text
+  (`df_proto.h`: DFST state, DFDO bearing, DFSP spectrum, DFGP gpsd, DFTG the other targets, DFAC the antenna
+  side's calibration), short text
   commands in.
 - Keeps a bearing log (a CSV file a day) and serves the target's IQ in Heimdall's format (ports 5000 and 5001) to a
   program on the network.
@@ -38,6 +40,14 @@ Receive only: nothing here transmits.
 
 - Lines the sticks up in hardware to a fraction of a sample while a program reads the IQ server (sample-rate
   slewing, with the rtlsdr_set_sample_slew of GoldCorpHF's rtlsdr-blog patch 0003).
+
+- Calibrates the antenna side too, which the noise source cannot see (it comes in behind the antenna sockets):
+  antenna cables of unequal lengths, unlike whips. On one transmitter at a known bearing (`b DEG`), a few seconds
+  of it give each antenna's phase against what the layout gives there (the covariance's principal eigenvector), taken
+  out from then on with the noise source's correction; kept in `/mnt/df_antcal.txt`, one a frequency, used within
+  2 % of it (DFAC says how it went). On made-up data with cables 40-150 degrees off, it finds them within 0.2
+  degrees and the fit at the source goes from 10 % to 98 %; without it a source elsewhere reads 4.7 degrees for
+  320 at a 66 % fit.
 
 Everything in ROADMAP.md is done; passive radar is parked. Not planned:
 output to the KrakenSDR apps, mapping services or TAK.

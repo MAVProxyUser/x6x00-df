@@ -260,6 +260,25 @@ bool df_uniform_line(const df_array_t *a) {
     return true;
 }
 
+bool df_custom_line(df_array_t *a) {
+    if (a->kind != DF_CUSTOM || a->n < 2) return false;
+    for (int k = 1; k < a->n; k++)
+        if (fabs(a->x[k] - a->x[0]) > 0.0005) return false;
+    double size = fabs(a->y[0] - a->y[a->n - 1]) / (a->n - 1);
+
+    if (size < 1e-6) return false;
+    a->kind = DF_ULA;
+    a->size = size;
+    for (int k = 0; k < a->n; k++) a->x[k] = 0;
+    /* even spacing to a tenth of a millimetre, ANT 0 at the left: exactly the uniform line, for ROOT-MUSIC */
+    bool even = a->y[0] > a->y[a->n - 1];
+
+    for (int k = 0; k < a->n && even; k++) even = fabs(a->y[k] - (a->y[0] - k * size)) < 1e-4;
+    if (even)
+        for (int k = 0; k < a->n; k++) a->y[k] = a->y[0] - k * size;
+    return true;
+}
+
 int df_poly_roots(const double complex *c, int d, double complex *z) {
     double complex a[2 * DF_MAXCH];
     double         big = 0;

@@ -138,8 +138,9 @@ static double   last_good_at = -1, last_bearing = -1, last_mirror = -1, last_unc
 #define HOLD_FIT    0.50
 static double   held_bearing = -1, held_mirror = -1, held_uncert, held_fit;
 static bool     slip_shown;
-/* A slip is taken for one only once the calibration it asked for finds a stick moved (a whole-sample delay or a phase
- * at 0 Hz SLIP_DEG or more from the last one's). With nothing moved the fit fell for the antennas or the signal (an
+/* A slip is taken for one only once the calibration it asked for finds a stick moved (its delay half a sample or more,
+ * whole and fraction together: a delay near half a sample comes out as k - 0.49 one time and k - 1 + 0.51 the next,
+ * the same delay, 2026-11-17; or a phase at 0 Hz SLIP_DEG or more from the last one's). With nothing moved the fit fell for the antennas or the signal (an
  * array no plane wave fits: unequal cables, the geometry set wrong, multipath), and calibrating again cures nothing:
  * the next look waits twice as long, up to SLIP_HOLD_MAX_S, back to SLIP_HOLD_S on a real one or a retune. Indoors
  * on FM through five whips in a line of no known spacing it asked every 10-25 s, every one finding the same delays
@@ -150,8 +151,8 @@ static bool     slip_shown;
 static double   slip_hold = SLIP_HOLD_S, hold_fc = -1, hold_f;
 static bool     search_ok, cal_moved;           /* the last searching calibration (calibrate(true)): done, and what it
                                                  * found */
-static int      moved_ch = -1, moved_k, moved_deg_ch = -1;
-static double   moved_deg;
+static int      moved_ch = -1, moved_deg_ch = -1;
+static double   moved_deg, moved_samp;
 
 static double now_s(void) {
     struct timespec t;
@@ -1093,6 +1094,8 @@ static bool wait_for(int64_t j, int n, double timeout) {
     return false;
 }
 
+static void ant_pick(void);
+
 static void engine_setup(void) {
     if (eng_on) df_engine_free(&eng);
     memset(&eng, 0, sizeof(eng));
@@ -1116,6 +1119,7 @@ static void engine_setup(void) {
     eng_on = df_engine_init(&eng, blk_n) == 0;
     if (!eng_on) logf_("engine: could not start (%d channels, array of %d)", eng.nch, arr.n);
     if (have_cal) df_engine_set_cal(&eng, &cal);
+    ant_pick();
     atomic_fetch_add(&set_gen, 1);
     atomic_store(&J_pub, -1);
     for (int m = 0; m < DF_MAXCH; m++) {
@@ -1126,6 +1130,194 @@ static void engine_setup(void) {
 
 static int16_t ddeg(double d) { return d < 0 ? -1 : (int16_t)lrint(fmod(d, 360) * 10) % 3600; }
 static int16_t clamp16(double v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : lrint(v)); }
+
+/* ------------------------------------------------- the antenna side: calibrations on a source at a known bearing */
+
+/* What the noise source cannot see, coming in behind the antenna sockets: each antenna's cable and whip. A source at
+ * a known bearing measures them (df_engine_ant_take, b DEG). Kept on the card one a frequency, as the phases the
+ * source gave each channel (so a layout set right afterwards still works them out right), each used within ANT_SPAN
+ * of where it was taken: a cable's phase grows with the frequency, so a band each */
+#define ANT_FILE    "/mnt/df_antcal.txt"
+#define ANT_MAX     16
+#define ANT_SPAN    0.02
+#define ANT_SECS    3.0
+
+typedef struct {
+    double    hz, brg;
+    long long when;
+    int       n;
+    double    raw[DF_MAXCH];
+} ant_t;
+
+static ant_t  ants[ANT_MAX];
+static int    nants, ant_use = -1;
+static double ant_cur[DF_MAXCH];            /* the phases taken out now (cal_lock: the other targets take them) */
+static bool   ant_cur_on;
+static int    ant_state = DF_AC_IDLE;
+static double ant_pct, ant_fit0, ant_fit1, ant_take_brg;
+static char   ant_why[56];
+
+static void ant_load(void) {
+    FILE *f = fopen(ANT_FILE, "r");
+    char  l[256];
+
+    nants = 0;
+    if (!f) return;
+    while (nants < ANT_MAX && fgets(l, sizeof(l), f)) {
+        ant_t a;
+        char *p = l;
+        int   used;
+
+        memset(&a, 0, sizeof(a));
+        if (l[0] == '#' || sscanf(p, "%lf %lf %lld%n", &a.hz, &a.brg, &a.when, &used) != 3) continue;
+        p += used;
+        while (a.n < DF_MAXCH && sscanf(p, "%lf%n", &a.raw[a.n], &used) == 1) a.n++, p += used;
+        if (a.hz >= 24e6 && a.hz <= 1766e6 && a.n >= 2) ants[nants++] = a;
+    }
+    fclose(f);
+}
+
+static void ant_save(void) {
+    FILE *f = fopen(ANT_FILE ".new", "w");
+
+    if (!f) {
+        logf_("antenna side: %s not written (%s)", ANT_FILE, strerror(errno));
+        return;
+    }
+    fprintf(f, "# x6x00-df: the antenna side (cables, whips), each taken on a source at a known bearing. A line each:\n"
+               "# the frequency (Hz), the source's bearing (degrees from the array's forward), when (Unix time), then\n"
+               "# what each channel saw after the noise source's calibration (degrees, CH0 0). Delete a line to forget it.\n");
+    for (int i = 0; i < nants; i++) {
+        fprintf(f, "%.0f %.1f %lld", ants[i].hz, ants[i].brg, ants[i].when);
+        for (int m = 0; m < ants[i].n; m++) fprintf(f, " %.2f", ants[i].raw[m]);
+        fprintf(f, "\n");
+    }
+    fflush(f);
+    fsync(fileno(f));
+    fclose(f);
+    if (rename(ANT_FILE ".new", ANT_FILE)) logf_("antenna side: %s not written (%s)", ANT_FILE, strerror(errno));
+}
+
+static void send_ac(void) {
+    df_ac_msg_t m;
+    time_t      now = time(NULL);
+
+    memset(&m, 0, sizeof(m));
+    memcpy(m.tag, "DFAC", 4);
+    m.state = (uint8_t)ant_state;
+    m.pct = (uint8_t)fmin(100, fmax(0, ant_pct * 100));
+    m.fit0_pct = (uint8_t)fmin(100, fmax(0, ant_fit0 * 100));
+    m.fit1_pct = (uint8_t)fmin(100, fmax(0, ant_fit1 * 100));
+    m.n = (uint8_t)nants;
+    m.in_use = ant_use >= 0;
+    if (ant_use >= 0) {
+        m.use_brg_ddeg = clamp16(ants[ant_use].brg * 10);
+        m.use_hz = (uint32_t)ants[ant_use].hz;
+        m.use_age_s = ants[ant_use].when > 0 && now >= ants[ant_use].when ? (uint32_t)(now - ants[ant_use].when)
+                                                                          : 0xffffffffu;
+    }
+    m.take_brg_ddeg = clamp16(ant_take_brg * 10);
+    for (int c = 0; c < DF_PROTO_MAXCH && c < DF_MAXCH; c++) m.ph_ddeg[c] = ant_cur_on ? clamp16(ant_cur[c] * 10) : 0;
+    snprintf(m.why, sizeof(m.why), "%s", ant_why);
+    send_msg(&m, sizeof(m));
+}
+
+/* the calibration for the target's frequency (the nearest within ANT_SPAN), worked out for the array set now, into
+ * the engine and the other targets' */
+static void ant_pick(void) {
+    double f = (double)fc + f_off, best = ANT_SPAN;
+    int    use = -1;
+
+    for (int i = 0; i < nants; i++) {
+        double d = fabs(ants[i].hz - f) / f;
+
+        if (d <= best && ants[i].n >= eng.arr.n) best = d, use = i;
+    }
+    pthread_mutex_lock(&cal_lock);
+    ant_use = use;
+    ant_cur_on = use >= 0;
+    memset(ant_cur, 0, sizeof(ant_cur));
+    if (use >= 0) df_ant_of_raw(&eng.arr, DF_C / ants[use].hz, ants[use].brg, ants[use].raw, ant_cur);
+    atomic_fetch_add(&cal_gen, 1);
+    pthread_mutex_unlock(&cal_lock);
+    if (eng_on) df_engine_set_ant(&eng, ant_cur_on ? ant_cur : NULL);
+}
+
+static void ant_take(double brg) {
+    ant_take_brg = brg;
+    ant_fit0 = ant_fit1 = ant_pct = 0;
+    if (!eng_on || !have_cal) {
+        ant_state = DF_AC_FAILED;
+        snprintf(ant_why, sizeof(ant_why), "not calibrated on the noise source yet");
+    } else {
+        df_engine_ant_take(&eng, brg, ANT_SECS);
+        ant_state = DF_AC_TAKING;
+        ant_why[0] = 0;
+        logf_("antenna side: %.0f s of the source at %.1f deg wanted, %.4f MHz", ANT_SECS, brg, ((double)fc + f_off) / 1e6);
+    }
+    send_ac();
+}
+
+static void ant_forget(void) {
+    if (ant_use < 0) return;
+    logf_("antenna side: the one at %.4f MHz forgotten", ants[ant_use].hz / 1e6);
+    ants[ant_use] = ants[--nants];
+    ant_save();
+    ant_pick();
+    send_ac();
+}
+
+/* after each block while one is taken: its progress, then what it found (kept, in use) or why not */
+static void ant_block(const df_est_t *e) {
+    if (ant_state != DF_AC_TAKING) return;
+    if (!e->ant_done && eng.ant_taking) {
+        bool step = (int)(e->ant_pct * 10) != (int)(ant_pct * 10);
+
+        ant_pct = e->ant_pct;
+        if (step) send_ac();
+        return;
+    }
+    if (e->ant_done <= 0) {             /* failed, or ended by a retune or new settings (a new engine) */
+        ant_state = DF_AC_FAILED;
+        snprintf(ant_why, sizeof(ant_why), "%.55s", eng.ant_why[0] ? eng.ant_why : "the settings changed while it was taken");
+        logf_("antenna side: not taken: %s", ant_why);
+        send_ac();
+        return;
+    }
+    double hz = (double)fc + f_off;
+    ant_t  a;
+    int    at = -1;
+
+    memset(&a, 0, sizeof(a));
+    a.hz = hz, a.brg = ant_take_brg, a.when = (long long)time(NULL), a.n = eng.arr.n;
+    df_raw_of_ant(&eng.arr, DF_C / hz, ant_take_brg, e->ant_ph, a.raw);
+    for (int i = 0; i < nants; i++)
+        if (fabs(ants[i].hz - hz) / hz <= ANT_SPAN / 4) at = i;        /* the one here before: replaced */
+    if (at < 0 && nants < ANT_MAX) at = nants++;
+    if (at < 0) {                                                       /* full: the oldest goes */
+        at = 0;
+        for (int i = 1; i < nants; i++)
+            if (ants[i].when < ants[at].when) at = i;
+    }
+    ants[at] = a;
+    ant_save();
+    ant_pick();
+    ant_state = DF_AC_DONE;
+    ant_pct = 1;
+    ant_fit0 = e->ant_fit0;
+    ant_fit1 = e->ant_fit1;
+    {
+        char l[200];
+        int  n = 0;
+
+        for (int m = 1; m < eng.nch; m++) n += snprintf(l + n, sizeof(l) - (size_t)n, " CH%d %+.1f", m, e->ant_ph[m]);
+        n += snprintf(l + n, sizeof(l) - (size_t)n, " deg; the source's share");
+        for (int m = 0; m < eng.nch; m++) n += snprintf(l + n, sizeof(l) - (size_t)n, " %.0f", 100 * e->ant_share[m]);
+        logf_("antenna side at %.4f MHz, the source at %.1f deg:%s %% (fit %.0f %% -> %.0f %%, eigenvalue %.1f dB)",
+              hz / 1e6, ant_take_brg, l, 100 * e->ant_fit0, 100 * e->ant_fit1, e->ant_eig_db);
+    }
+    send_ac();
+}
 
 /* ------------------------------------------------------------------------------------ other targets (ROADMAP 8)
  * Up to DF_PROTO_TARGETS more targets in the Kraken's passband besides the main one (commands 1-3): each its own
@@ -1272,6 +1464,7 @@ static void *tg_worker(void *arg) {
             cgen = atomic_load(&cal_gen);
             if (have_cal) df_engine_set_cal(e, &cal);
             else e->have_cal = false;       /* none now (a failed one after a slew): no bearings on the old one */
+            df_engine_set_ant(e, ant_cur_on ? ant_cur : NULL);
             pthread_mutex_unlock(&cal_lock);
             j = -1;
         }
@@ -1466,11 +1659,11 @@ static bool calibrate(bool search) {
     }
     pthread_mutex_lock(&cal_lock);
     if (search) {                       /* moved since the last? (none before: as good as moved) */
-        cal_moved = !have_cal, moved_ch = moved_deg_ch = -1, moved_k = 0, moved_deg = 0;
+        cal_moved = !have_cal, moved_ch = moved_deg_ch = -1, moved_samp = 0, moved_deg = 0;
         for (int m = 1; m < nch && have_cal; m++) {
-            double d = fabs(remainder((c.phi[m] - cal.phi[m]) * 180 / M_PI, 360));
+            double d = fabs(remainder((c.phi[m] - cal.phi[m]) * 180 / M_PI, 360)), ds = c.k[m] + c.tau[m] - cal.tau[m];
 
-            if (c.k[m] && moved_ch < 0) moved_ch = m, moved_k = c.k[m];
+            if (fabs(ds) >= 0.5 && moved_ch < 0) moved_ch = m, moved_samp = ds;
             if (d > moved_deg) moved_deg = d, moved_deg_ch = m;
         }
         cal_moved |= moved_ch >= 0 || moved_deg >= SLIP_DEG;
@@ -1575,6 +1768,7 @@ static void send_state(void) {
         }
     }
     send_msg(&s, sizeof(s));
+    send_ac();
 }
 
 /* ------------------------------------------------------------------------------------------------ the bearing log */
@@ -1752,6 +1946,7 @@ static bool parse_array(const char *a, df_array_t *out) {
             out->x[m] = x / 1000.0;
             out->y[m] = y / 1000.0;
         }
+        df_custom_line(out);
         return true;
     }
     return false;
@@ -1852,9 +2047,14 @@ static int apply(const char *c) {
         case 'x':
             if (sscanf(c + 1, "%lf", &a) == 1) eng.user_off = user_off = (unsigned)a & 0xff;
             break;
+        case 'b':
+            if (sscanf(c + 1, "%lf", &a) == 1 && a > -360 && a < 720) ant_take(fmod(a + 360, 360));
+            break;
+        case 'B': ant_forget(); break;
         case 'c': return 1;
         case 'Q': return 3;
     }
+    if (c[0] && strchr("fFta", c[0])) ant_pick();      /* the calibration for this frequency (and this array) */
     if (c[0] && strchr("amqkwox", c[0])) atomic_fetch_add(&set_gen, 1);   /* the other targets' engines anew */
     return 0;
 }
@@ -1963,7 +2163,7 @@ static void slip_verdict(void) {
         slips++;
         slip_hold = SLIP_HOLD_S;
         if (!search_ok) logf_("slip (%d so far): the calibration failed", slips);
-        else if (moved_ch >= 0) logf_("slip (%d so far): CH%d %+d samples", slips, moved_ch, moved_k);
+        else if (moved_ch >= 0) logf_("slip (%d so far): CH%d %+.1f samples", slips, moved_ch, moved_samp);
         else if (moved_deg_ch >= 0) logf_("slip (%d so far): CH%d's phase %.0f deg off", slips, moved_deg_ch, moved_deg);
         else logf_("slip (%d so far)", slips);
     } else {
@@ -2143,6 +2343,7 @@ static void run(bool print) {
                : e.gate ? DF_ST_TRACK
                : last_good_at >= 0 && t - last_good_at < HOLD_S ? DF_ST_HOLD
                : DF_ST_LISTEN;
+            ant_block(&e);
             send_estimate(&e, seq);
             send_spectrum(seq);
             send_targets(seq);
@@ -2287,6 +2488,7 @@ int main(int argc, char **argv) {
     pthread_t gth;
 
     iq_start();                         /* Heimdall's IQ server, for other programs */
+    ant_load();                         /* the antenna side's calibrations (b DEG) */
     df_gps_init(&gps);
     if (pthread_create(&gth, NULL, gps_thread, NULL) == 0) pthread_detach(gth);     /* gpsd, when it runs */
 

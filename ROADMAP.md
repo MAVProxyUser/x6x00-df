@@ -155,6 +155,19 @@ The direction was found there (the other way doubled every fraction).
   a ppm, and a loop that slews each stick until its fractional delay is under 0.03 sample, as Heimdall's does, run
   after each calibration while the IQ server has a client.
 
+## 11. The antenna side, and layouts from the older literature
+
+Done 2026-11-17 (the owner: five whips in a line, "NOT to spec"; one channel came out about 150 degrees off the
+rest on FM, its cable or whip): `b DEG` takes the antenna side's phases on a transmitter at a known bearing
+(df_engine_ant_take: the principal eigenvector of a few seconds' covariance against the steering vector there, one
+source wanted, 6 dB of eigenvalue), `B` forgets the one in use; kept as what the source gave each channel
+(`/mnt/df_antcal.txt`) so a layout set right later still works them out, used within 2 % of where it was taken,
+also in the other targets' engines; DFAC to the GUI. Phase only. And a custom layout on one line across is taken as
+a line (df_custom_line), so the GUI's minimum-redundancy line (Moffet 1968: 0, 1, 4, 7, 9 units) and a line
+measured by hand get the mirror and front-only search a line needs; 4 round 1 (Adcock with its sense antenna) and an
+L go as custom layouts. Checked on made-up data (df_test 95) and on the radio's Kraken (taken, kept, used and
+forgotten at 440 MHz).
+
 ## Parked: passive radar
 
 - KrakenRF's passive radar (`krakensdr_pr`, a fork at github.com/mfkiwl/krakensdr_pr) and the older pyapril, which
